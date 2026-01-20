@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  mailboy:
+    build: .
+    container_name: mailboy_app
+    restart: always
+    network_mode: "host" # <--- BYPASS: Use LXC network directly
+    environment:
+      # Since we share the network, services are now on 'localhost'
+      - MONGODB_URI=mongodb://127.0.0.1:27017/mailboy
+      - REDIS_URL=redis://127.0.0.1:6379
+      - NODE_ENV=production
+    depends_on:
+      - mongo
+      - redis
+    volumes:
+      - ./img_cache:/app/img_cache
+
+  mongo:
+    image: mongo:6
+    container_name: mailboy_mongo
+    restart: always
+    network_mode: "host" # <--- BYPASS
+    volumes:
+      - mongo_data:/data/db
+
+  redis:
+    image: redis:alpine
+    container_name: mailboy_redis
+    restart: always
+    network_mode: "host" # <--- BYPASS
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+
+volumes:
+  mongo_data:
+  redis_data:

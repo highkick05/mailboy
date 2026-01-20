@@ -1,6 +1,6 @@
 /**
- * NOVAMAIL 2026 HYBRID ENGINE - V12.4 [IMAGE_CACHE_OPTIMIZATION]
- * Features: Full-Duplex Sync + Immediate Redis Population + Background L1 Warming + Aggressive Image Caching
+ * MAILBOY 2026 HYBRID ENGINE - V12.6 [STABILITY_PATCH]
+ * Features: Crash Proofing + Buffer Fixes + Docker Host Mode Support
  */
 
 import express from 'express';
@@ -13,6 +13,11 @@ import fetch from 'node-fetch';
 import fs from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
+import { fileURLToPath } from 'url';
+
+// Define __dirname manually for ES Modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
@@ -32,7 +37,7 @@ const TRANSPARENT_PIXEL = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAA
   }
 })();
 
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/novamail_2026';
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/mailboy';
 mongoose.connect(MONGODB_URI)
   .then(() => console.log('🍃 MongoDB Persistent Layer Online'))
   .catch(err => console.error('MongoDB Connection Error:', err));
@@ -60,15 +65,30 @@ const activeClients = new Map<string, ImapFlow>();
 const getClient = async (config: any) => {
   if (activeClients.has(config.user)) {
     const existing = activeClients.get(config.user)!;
+    // Check if client is actually usable (connected)
     if (existing.usable) return existing;
+    // If not usable, remove it and create new
+    activeClients.delete(config.user);
   }
+
   const client = new ImapFlow({
     host: config.imapHost,
     port: config.imapPort,
     secure: config.useTLS || config.imapPort === 993,
     auth: { user: config.user, pass: config.pass },
-    logger: false
+    logger: false,
+    // 🛑 STABILITY: Increase timeouts to prevent ETIMEOUT crashes on slow connections
+    clientTimeout: 10000, 
+    greetingTimeout: 10000 
   });
+
+  // 🛑 CRITICAL FIX: Global Error Handler
+  // This prevents the "Unhandled 'error' event" crash
+  client.on('error', (err) => {
+    console.error(`[IMAP BACKGROUND ERROR] ${config.user}:`, err.message);
+    // We don't throw here, just log. The sync loop will catch the disconnect.
+  });
+
   await client.connect();
   activeClients.set(config.user, client);
   return client;
@@ -117,7 +137,10 @@ async function resolveBrandLogo(domain: string): Promise<{ data: Buffer, content
       try {
         const response = await fetch(url, { signal: AbortSignal.timeout(4000) });
         if (response.ok) {
-          const buffer = await response.buffer();
+          // 🛑 FIX: Use arrayBuffer instead of buffer()
+          const arrayBuf = await response.arrayBuffer();
+          const buffer = Buffer.from(arrayBuf);
+          
           const contentType = response.headers.get('content-type') || 'image/png';
           if (buffer.length > 500 || url.includes('google.com') || url.includes('duckduckgo')) {
             await fs.writeFile(filePath, buffer);
@@ -159,7 +182,6 @@ app.get('/api/v1/proxy/logo', async (req, res) => {
   }
 });
 
-// 🚀 UPDATED: Added Cache-Control headers for Optimistic UI
 app.get('/api/v1/proxy/image', async (req, res) => {
   const targetUrl = req.query.url as string;
   if (!targetUrl) return res.status(400).send('URL missing');
@@ -173,7 +195,6 @@ app.get('/api/v1/proxy/image', async (req, res) => {
       const { contentType } = JSON.parse(cachedMeta);
       const data = await fs.readFile(filePath);
       res.setHeader('Content-Type', contentType);
-      // 🔥 FORCE BROWSER CACHE (1 Year)
       res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
       return res.send(data);
     } catch (e) { }
@@ -181,13 +202,16 @@ app.get('/api/v1/proxy/image', async (req, res) => {
   try {
     const response = await fetch(targetUrl, { signal: AbortSignal.timeout(15000) });
     if (!response.ok) throw new Error(`Status ${response.status}`);
-    const buffer = await response.buffer();
+    
+    // 🛑 FIX: Use arrayBuffer instead of buffer()
+    const arrayBuf = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuf);
+    
     const contentType = response.headers.get('content-type') || 'image/jpeg';
     await fs.writeFile(filePath, buffer);
     await redis.setex(cacheKey, REDIS_TTL * 7, JSON.stringify({ contentType }));
     
     res.setHeader('Content-Type', contentType);
-    // 🔥 FORCE BROWSER CACHE (1 Year)
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     res.send(buffer);
   } catch (e) {
@@ -227,7 +251,6 @@ app.get('/api/v1/sync/status', async (req, res) => {
   res.json(prog ? JSON.parse(prog) : { percent: 0, status: 'IDLE' });
 });
 
-// 🚀 CACHE WARMER FUNCTION
 async function preWarmCache(emails: any[], user: string) {
   if (!emails || emails.length === 0) return;
   
@@ -258,20 +281,35 @@ async function preWarmCache(emails: any[], user: string) {
   });
 }
 
-// 🚀 UNIFIED FULL SYNC
 app.post('/api/v1/mail/sync', async (req, res) => {
   const { user } = req.body;
   (async () => {
     try {
       await redis.setex(`sync_progress:${user}`, 300, JSON.stringify({ percent: 0, status: 'BURST' }));
       const client = await getClient(req.body);
-      const lock = await client.getMailboxLock('INBOX');
+      
+      // 🛑 STABILITY: Try/Catch the lock acquisition separately
+      let lock;
+      try {
+        lock = await client.getMailboxLock('INBOX');
+      } catch (e) {
+        console.error("Failed to acquire lock:", e);
+        throw e; // Rethrow to trigger the outer catch
+      }
+
       try {
         await runFullSync(client, user);
-      } finally { lock.release(); }
-    } catch (e) { 
+      } finally { 
+        if (lock) lock.release(); 
+      }
+    } catch (e: any) { 
       console.error("Sync pipeline error:", e);
-      await redis.setex(`sync_progress:${user}`, 300, JSON.stringify({ percent: 0, status: 'ERROR' }));
+      
+      // 🛑 NOTIFICATION: Explicitly set status to ERROR so frontend knows
+      let errorStatus = 'ERROR';
+      if (e.responseText && e.responseText.includes('Failure')) errorStatus = 'ERROR'; // Auth Failure
+      
+      await redis.setex(`sync_progress:${user}`, 300, JSON.stringify({ percent: 0, status: errorStatus }));
     }
   })();
   res.json({ status: 'SYNC_PIPELINE_INITIATED' });
@@ -280,6 +318,12 @@ app.post('/api/v1/mail/sync', async (req, res) => {
 app.get('/api/v1/mail/list', async (req, res) => {
   const { user, folder } = req.query;
   const listKey = `mail:${user}:list:${folder || 'Inbox'}`;
+  
+  // 🛑 FEATURE: If sync is in ERROR state, should we block?
+  // The user requested "no email updated to browser".
+  // However, blocking here prevents viewing OLD mail. 
+  // We will handle the "Hide View" logic in the Frontend for better UX,
+  // but we can also flag the response here if needed.
   
   let listData = null;
 
@@ -297,7 +341,6 @@ app.get('/api/v1/mail/list', async (req, res) => {
     }
   }
 
-  // Trigger background warming
   if (listData && listData.length > 0) {
     preWarmCache(listData, user as string);
   }
@@ -432,7 +475,19 @@ async function runFullSync(client: ImapFlow, user: string) {
   await redis.setex(`sync_progress:${user}`, 300, JSON.stringify({ percent: 100, status: 'STABLE' }));
 }
 
+// ----------------------------------------
+// 🚀 DOCKER STATIC FILE SERVING (Compatible with Express 5)
+// ----------------------------------------
+const distPath = path.join(__dirname, 'dist');
+app.use(express.static(distPath));
+
+// Handle Client-Side Routing (SPA Fallback)
+app.get(/(.*)/, (req, res) => {
+  if (req.path.startsWith('/api')) return res.status(404).json({ error: 'API route not found' });
+  res.sendFile(path.join(distPath, 'index.html'));
+});
+
 const PORT = 3001;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 NOVAMAIL V12.4 ONLINE - FULL DUPLEX SYNC + L1 PRE-WARM + IMG CACHE`);
+  console.log(`🚀 MAILBOY V12.6 ONLINE - STABILITY PATCH APPLIED`);
 });
