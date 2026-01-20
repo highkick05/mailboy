@@ -1,0 +1,5 @@
+{
+  "name": "NovaMail 2026",
+  "description": "A high-performance hybrid webmail client demonstrating 2026 industry-standard Redis/MongoDB Cache-Aside architecture.",
+  "requestFramePermissions": []
+}
