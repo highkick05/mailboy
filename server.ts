@@ -1,6 +1,6 @@
 /**
- * MAILBOY 2026 HYBRID ENGINE - V12.6 [STABILITY_PATCH]
- * Features: Crash Proofing + Buffer Fixes + Docker Host Mode Support
+ * MAILBOY 2026 HYBRID ENGINE - V12.7 [SSL_DUAL_MODE]
+ * Features: Crash Proofing + Buffer Fixes + Docker Host Mode + HTTPS/SSL Support
  */
 
 import express from 'express';
@@ -11,6 +11,8 @@ import cors from 'cors';
 import { Buffer } from 'buffer';
 import fetch from 'node-fetch';
 import fs from 'fs/promises';
+import fsSync from 'fs'; // 🛑 NEW: Sync fs for cert loading
+import https from 'https'; // 🛑 NEW: HTTPS module
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
@@ -71,15 +73,15 @@ const getClient = async (config: any) => {
     activeClients.delete(config.user);
   }
 
-  const client = new ImapFlow({
+	const client = new ImapFlow({
     host: config.imapHost,
     port: config.imapPort,
     secure: config.useTLS || config.imapPort === 993,
     auth: { user: config.user, pass: config.pass },
     logger: false,
-    // 🛑 STABILITY: Increase timeouts to prevent ETIMEOUT crashes on slow connections
-    clientTimeout: 10000, 
-    greetingTimeout: 10000 
+    // 🛑 UPDATE: Increase timeouts to 60s to prevent "Connection not available" drops
+    clientTimeout: 60000, 
+    greetingTimeout: 30000 
   });
 
   // 🛑 CRITICAL FIX: Global Error Handler
@@ -487,7 +489,27 @@ app.get(/(.*)/, (req, res) => {
   res.sendFile(path.join(distPath, 'index.html'));
 });
 
-const PORT = 3001;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 MAILBOY V12.6 ONLINE - STABILITY PATCH APPLIED`);
+// ----------------------------------------
+// 🚀 DUAL MODE: HTTP + HTTPS LISTENERS
+// ----------------------------------------
+
+// 1. Start Standard HTTP Server (Port 3001)
+const HTTP_PORT = 3001;
+app.listen(HTTP_PORT, '0.0.0.0', () => {
+  console.log(`🚀 MAILBOY HTTP ONLINE: http://localhost:${HTTP_PORT}`);
 });
+
+// 2. Start Secure HTTPS Server (Port 3002) - Fails gracefully if no certs
+try {
+  const httpsOptions = {
+    key: fsSync.readFileSync(path.join(__dirname, 'server.key')),
+    cert: fsSync.readFileSync(path.join(__dirname, 'server.cert'))
+  };
+  
+  const HTTPS_PORT = 3002;
+  https.createServer(httpsOptions, app).listen(HTTPS_PORT, '0.0.0.0', () => {
+    console.log(`🔒 MAILBOY HTTPS ONLINE: https://localhost:${HTTPS_PORT}`);
+  });
+} catch (e) {
+  console.log("⚠️ HTTPS skipped: server.key or server.cert not found in /app");
+}

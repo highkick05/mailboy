@@ -3,9 +3,9 @@ import { Email, EmailFolder, CacheStats, MailConfig } from '../types';
 class HybridMailService {
   private config: MailConfig | null = null;
   
+  // 🛑 FIX: Use relative path so it works on both HTTP (3001) and HTTPS (3002)
   public get API_BASE() {
-    const host = window.location.hostname || 'localhost';
-    return `http://${host}:3001/api/v1`;
+    return '/api/v1';
   }
 
   setConfig(config: MailConfig) {
@@ -33,6 +33,20 @@ class HybridMailService {
       if (!resp.ok) return { status: 'IDLE' };
       return resp.json();
     } catch { return { status: 'IDLE' }; }
+  }
+
+  // 🛑 ADDED: Missing method required by App.tsx for auto-hydration
+  async triggerHydration(): Promise<void> {
+    if (!this.config) return;
+    try {
+      await fetch(`${this.API_BASE}/mail/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(this.config)
+      });
+    } catch (e) {
+      console.warn("Hydration trigger failed silently", e);
+    }
   }
 
   async fetchRemoteMail(): Promise<{ log: string }> {

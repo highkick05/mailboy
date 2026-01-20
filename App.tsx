@@ -131,12 +131,12 @@ const App: React.FC = () => {
   };
 
   const handleSaveConfig = async (config: MailConfig) => {
-    const host = window.location.hostname || 'localhost';
+    // 🛑 UPDATED: Removed unused 'host' and 'apiPort' variables
+    // Now uses relative path for Protocol Agnostic fetching
     try {
-      const apiPort = '3001'; 
-      const response = await fetch(`http://${host}:${apiPort}/api/v1/config/save`, {
-        method: 'POST', 
-        headers: { 'Content-Type': 'application/json' }, 
+      const response = await fetch(`/api/v1/config/save`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(config)
       });
       if (!response.ok) throw new Error("BRIDGE_OFFLINE");
@@ -165,9 +165,9 @@ const App: React.FC = () => {
   };
 
   const handleResetSystem = async () => {
-    const host = window.location.hostname || 'localhost';
+    // 🛑 UPDATED: Uses relative path
     try {
-      const resp = await fetch(`http://${host}:3001/api/v1/debug/reset`, { method: 'DELETE' });
+      const resp = await fetch(`/api/v1/debug/reset`, { method: 'DELETE' });
       if (!resp.ok) throw new Error("Wipe failed");
       
       localStorage.removeItem('nova_mail_config');
@@ -250,7 +250,11 @@ const App: React.FC = () => {
                     {!mailConfig && (
                       <div className="bg-white dark:bg-slate-900 border-2 border-dashed border-slate-200 dark:border-slate-800 rounded-[3rem] p-16 text-center animate-in fade-in zoom-in-95 duration-500 shadow-sm shrink-0">
                         {/* ... (Welcome Content) ... */}
+                        <div className="w-24 h-24 bg-blue-100 dark:bg-blue-900/30 rounded-full flex items-center justify-center mx-auto mb-8">
+                          <svg className="w-12 h-12 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" /></svg>
+                        </div>
                         <h2 className="text-3xl font-black mb-4">Initialize mailboy</h2>
+                        <p className="text-slate-500 dark:text-slate-400 mb-10 max-w-sm mx-auto font-medium">Configure your L3 Ingress/Egress nodes to start the secure real-time protocol handshake.</p>
                         <button 
                           onClick={() => setIsSettingsOpen(true)}
                           className="bg-blue-600 hover:bg-blue-700 text-white font-black py-4 px-12 rounded-2xl shadow-2xl shadow-blue-600/30 transition-all active:scale-95 uppercase text-xs tracking-[0.2em]"

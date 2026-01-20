@@ -16,6 +16,9 @@ services:
       - redis
     volumes:
       - ./img_cache:/app/img_cache
+      # Mount the certificates
+      - ./server.key:/app/server.key
+      - ./server.cert:/app/server.cert
 
   mongo:
     image: mongo:6
