@@ -1,45 +1,42 @@
 # ----------------------------------------
-# STAGE 1: Build the Frontend (Vite)
+# 1. BUILDER STAGE (Frontend)
 # ----------------------------------------
+# 🛑 FIX: Capitalized 'AS' to match 'FROM'
 FROM node:20-alpine AS frontend-builder
 WORKDIR /app
-
-# Copy dependency definitions
 COPY package*.json ./
 RUN npm install
-
-# Copy source code and build the React app
 COPY . .
-# This creates the /dist folder
-RUN npm run build 
+RUN npm run build
 
 # ----------------------------------------
-# STAGE 2: Setup the Backend (Node)
+# 2. RUNNER STAGE (Production)
 # ----------------------------------------
 FROM node:20-alpine
 WORKDIR /app
 
-# Install dependencies (Production only to save space)
+# Install dependencies (only production)
 COPY package*.json ./
-RUN npm install
+RUN npm install --only=production
 
-# Copy backend source files
-COPY server.ts ./
-COPY tsconfig.json ./
-# (Optional) If you have other folders like /services or /types, copy them too:
+# 🛑 FIX: Explicitly install tsx to prevent "npm warn exec" delays
+RUN npm install tsx
+
+# Copy Files
+COPY *.ts ./
+COPY server.key server.cert ./
 COPY services ./services
 COPY components ./components
-COPY types.ts ./
+COPY tsconfig.json ./
 
-# Copy the built frontend from Stage 1
+# Copy the built frontend from the previous stage
 COPY --from=frontend-builder /app/dist ./dist
 
-# Create cache directories manually to ensure permissions
+# Create cache directory
 RUN mkdir -p img_cache/logos
 
-# Expose the API/App port
+# Expose API Port
 EXPOSE 3001
 
-# Start the Hybrid Engine
-# Using ts-node for simplicity (ensure ts-node is in package.json)
+# Start the server
 CMD ["npx", "tsx", "server.ts"]

@@ -37,13 +37,13 @@ const EmailDetail: React.FC<EmailDetailProps> = ({ email, onClose }) => {
     const isHtml = clean.includes('<div') || clean.includes('<table') || clean.includes('<p');
     const isDark = document.documentElement.classList.contains('dark');
     
-    // 4. INJECT SHADOW DOM STYLES (NUCLEAR CENTERING UPDATE)
+    // 4. INJECT SHADOW DOM STYLES (Full Width Centering)
     const themeStyles = `
       <style>
         :host { display: block; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: ${isDark ? '#f1f5f9' : '#1e293b'}; line-height: 1.6; width: 100%; }
         
         /* LAYOUT RESET */
-        body, .email-content { margin: 0 auto !important; width: 100%; max-width: 100%; display: flex; flex-direction: column; align-items: center; }
+        body, .email-content { margin: 0; width: 100%; max-width: 100%; }
         
         /* TABLE CENTERING */
         table { margin-left: auto !important; margin-right: auto !important; max-width: 100% !important; }
@@ -52,11 +52,9 @@ const EmailDetail: React.FC<EmailDetailProps> = ({ email, onClose }) => {
         img { 
           max-width: 100% !important; 
           height: auto !important; 
-          border-radius: 12px; 
+          border-radius: 8px; 
           display: block !important; 
-          margin-left: auto !important; 
-          margin-right: auto !important; 
-          float: none !important; /* Overrides align="left" */
+          margin: 10px auto !important;
         }
 
         /* TEXT LINKS */
@@ -66,57 +64,78 @@ const EmailDetail: React.FC<EmailDetailProps> = ({ email, onClose }) => {
         /* ELEMENTS */
         blockquote { border-left: 4px solid #cbd5e1; padding-left: 16px; margin-left: 0; color: #64748b; }
         pre, code { background: ${isDark ? '#1e293b' : '#f1f5f9'}; padding: 4px 8px; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; }
-        div { max-width: 100%; box-sizing: border-box; }
       </style>
     `;
 
     return `
       ${themeStyles}
       <div class="email-content">
-        ${isHtml ? clean : `<div style="white-space: pre-wrap; width: 100%;">${clean}</div>`}
+        ${isHtml ? clean : `<div style="white-space: pre-wrap; width: 100%; padding: 20px;">${clean}</div>`}
       </div>
     `;
   }, [email]);
 
   if (!email) return null;
-  const displayName = formatSenderName(email.from);
+
+  // Smart extraction (matches EmailList logic)
+  const senderName = (email as any).senderName || formatSenderName(email.from);
+  const senderAddr = (email as any).senderAddr || email.from;
 
   return (
-    <div className="w-full">
-      <div className="max-w-5xl mx-auto flex flex-col bg-white dark:bg-slate-900 rounded-[2rem] sm:rounded-[3rem] border border-slate-200 dark:border-slate-800 shadow-2xl">
-        {/* Header */}
-        <div className="p-6 sm:px-10 sm:py-8 border-b border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row justify-between items-start gap-6 bg-slate-50/50 dark:bg-slate-950/40 shrink-0 rounded-t-[2rem] sm:rounded-t-[3rem]">
-          <div className="flex gap-4 sm:gap-6 items-center w-full min-w-0">
-            <button onClick={onClose} className="p-3 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 rounded-2xl text-slate-500 transition-all border border-slate-200 dark:border-slate-700 active:scale-90 shadow-sm">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg>
-            </button>
-            <div className="flex items-center gap-4 min-w-0 flex-1">
-               <BrandAvatar from={email.from} displayName={displayName} size="md" />
-               <div className="min-w-0 flex-1">
-                  <h2 className="text-xl sm:text-2xl font-black text-slate-900 dark:text-slate-100 tracking-tight leading-tight mb-1 truncate pr-4">{email.subject}</h2>
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-bold text-slate-600 dark:text-slate-400 truncate">{displayName}</span>
-                    <span className="text-slate-300 dark:text-slate-600">•</span>
-                    <span className="text-[10px] font-mono text-slate-400">{new Date(email.timestamp).toLocaleString()}</span>
-                  </div>
-               </div>
-            </div>
+    // 🛑 OUTER WRAPPER: Centers the content and handles the background gap
+    <div className="w-full h-full flex flex-col items-center bg-slate-50 dark:bg-slate-950">
+      
+      {/* 🛑 CENTRAL COLUMN: Limited width (max-w-7xl) to match header bar */}
+      <div className="w-full max-w-7xl h-full flex flex-col bg-white dark:bg-slate-900 shadow-xl border-x border-slate-200 dark:border-slate-800">
+        
+        {/* HEADER (Fixed Top) */}
+        <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-start gap-4 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md shrink-0 z-10">
+          <button onClick={onClose} className="mt-1 p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full text-slate-500 transition-colors">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg>
+          </button>
+          
+          <div className="flex-1 min-w-0">
+             <div className="flex items-center justify-between mb-2">
+                <h1 className="text-xl sm:text-2xl font-black text-slate-900 dark:text-slate-100 tracking-tight leading-tight truncate">
+                  {email.subject}
+                </h1>
+                <span className={`hidden sm:inline-block px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border ${email.hydrated ? 'bg-green-50 text-green-600 border-green-200' : 'bg-blue-50 text-blue-600 border-blue-200'}`}>
+                  {email.hydrated ? 'Active' : 'Syncing'}
+                </span>
+             </div>
+
+             <div className="flex items-center gap-3">
+                <BrandAvatar emailAddr={senderAddr} displayName={senderName} />
+                <div className="flex flex-col">
+                   <div className="flex items-baseline gap-2">
+                      <span className="text-sm font-bold text-slate-900 dark:text-slate-100">{senderName}</span>
+                      <span className="text-xs text-slate-400 dark:text-slate-500 font-mono hidden sm:inline">&lt;{senderAddr}&gt;</span>
+                   </div>
+                   <span className="text-xs text-slate-400 dark:text-slate-500">
+                      {new Date(email.timestamp).toLocaleString(undefined, { dateStyle: 'full', timeStyle: 'short' })}
+                   </span>
+                </div>
+             </div>
           </div>
-          <span className={`px-4 py-2 rounded-full text-[9px] font-black uppercase tracking-widest border shrink-0 ${email.hydrated ? 'bg-green-50 text-green-600 border-green-200 dark:bg-green-900/20 dark:text-green-400' : 'bg-blue-50 text-blue-600 border-blue-200 animate-pulse'}`}>
-            {email.hydrated ? 'L1 Memory Active' : 'Relay Syncing'}
-          </span>
         </div>
 
-        {/* Content Area */}
-        <div className="bg-white dark:bg-slate-950 p-6 sm:p-12 min-h-[400px]">
-          <ShadowView html={sanitizedContent} className="w-full" />
+        {/* CONTENT AREA (Scrollable) */}
+        <div className="flex-1 overflow-y-auto bg-white dark:bg-slate-900 relative custom-scrollbar">
+          <div className="p-6 sm:p-10 w-full">
+            <ShadowView html={sanitizedContent} className="w-full min-h-[500px]" />
+          </div>
         </div>
 
-        {/* Footer */}
-        <div className="p-6 bg-slate-50/50 dark:bg-slate-950/40 flex justify-center gap-4 shrink-0 border-t border-slate-100 dark:border-slate-800 rounded-b-[2rem] sm:rounded-b-[3rem]">
-          <button className="flex-1 py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl font-black text-xs uppercase tracking-widest active:scale-95 transition-all shadow-xl shadow-blue-600/20">Reply</button>
-          <button className="flex-1 py-4 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 rounded-2xl font-black text-xs uppercase tracking-widest active:scale-95 transition-all border border-slate-200 dark:border-slate-700 shadow-sm">Forward</button>
+        {/* FOOTER (Fixed Bottom) */}
+        <div className="p-4 bg-slate-50/80 dark:bg-slate-950/80 border-t border-slate-100 dark:border-slate-800 shrink-0 flex gap-3 justify-end backdrop-blur-sm">
+          <button className="px-6 py-2 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg text-sm font-bold border border-slate-200 dark:border-slate-700 transition-all shadow-sm">
+            Forward
+          </button>
+          <button className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold shadow-lg shadow-blue-600/20 transition-all">
+            Reply
+          </button>
         </div>
+
       </div>
     </div>
   );

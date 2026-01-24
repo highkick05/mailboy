@@ -1,172 +1,53 @@
-/**
- * MAILBOY 2026 HYBRID ENGINE - V12.7 [SSL_DUAL_MODE]
- * Features: Crash Proofing + Buffer Fixes + Docker Host Mode + HTTPS/SSL Support
- */
-
 import express from 'express';
-import { ImapFlow } from 'imapflow';
-import Redis from 'ioredis';
-import mongoose from 'mongoose';
 import cors from 'cors';
 import { Buffer } from 'buffer';
-import fetch from 'node-fetch';
 import fs from 'fs/promises';
-import fsSync from 'fs'; // 🛑 NEW: Sync fs for cert loading
-import https from 'https'; // 🛑 NEW: HTTPS module
+import fsSync from 'fs'; 
+import https from 'https'; 
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { ImapFlow } from 'imapflow';
 
-// Define __dirname manually for ES Modules
+// Imports
+import { redis, connectDB, EmailModel } from './db';
+import { resolveBrandLogo, resolveBrandName, TRANSPARENT_PIXEL } from './logo-engine';
+import { startWorkerSwarm, runFullSync, runQuickSync, getQueue, activeClients, syncLocks, syncCooldowns, userWorkers, workerState, systemStats, getFolderMap, preWarmCache } from './workers';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
 const CACHE_DIR = path.join(process.cwd(), 'img_cache');
-const LOGO_CACHE_DIR = path.join(CACHE_DIR, 'logos');
-
 const REDIS_TTL = 86400; 
-const TRANSPARENT_PIXEL = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 
-(async () => {
-  try {
-    await fs.mkdir(CACHE_DIR, { recursive: true });
-    await fs.mkdir(LOGO_CACHE_DIR, { recursive: true });
-    console.log(`📂 Cache architecture initialized: ${CACHE_DIR}`);
-  } catch (e) {
-    console.error('Failed to create cache directory', e);
-  }
-})();
-
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/mailboy';
-mongoose.connect(MONGODB_URI)
-  .then(() => console.log('🍃 MongoDB Persistent Layer Online'))
-  .catch(err => console.error('MongoDB Connection Error:', err));
-
-const EmailSchema = new mongoose.Schema({
-  id: { type: String, unique: true, index: true },
-  user: { type: String, index: true },
-  uid: Number,
-  from: String,
-  to: String,
-  subject: String,
-  body: { type: String, default: "" },
-  timestamp: { type: Number, index: true },
-  read: Boolean,
-  folder: { type: String, index: true }
-});
-
-const EmailModel = mongoose.model('Email', EmailSchema);
+// Init
+connectDB();
+(async () => { try { await fs.mkdir(CACHE_DIR, { recursive: true }); } catch (e) {} })();
 
 app.use(cors() as any);
 app.use(express.json() as any);
 
-const activeClients = new Map<string, ImapFlow>();
+// =========================================================
+// API ROUTES
+// =========================================================
 
-const getClient = async (config: any) => {
-  if (activeClients.has(config.user)) {
-    const existing = activeClients.get(config.user)!;
-    // Check if client is actually usable (connected)
-    if (existing.usable) return existing;
-    // If not usable, remove it and create new
-    activeClients.delete(config.user);
-  }
+app.get('/api/v1/health', (req, res) => { res.json({ status: 'UP', timestamp: Date.now() }); });
 
-	const client = new ImapFlow({
-    host: config.imapHost,
-    port: config.imapPort,
-    secure: config.useTLS || config.imapPort === 993,
-    auth: { user: config.user, pass: config.pass },
-    logger: false,
-    // 🛑 UPDATE: Increase timeouts to 60s to prevent "Connection not available" drops
-    clientTimeout: 60000, 
-    greetingTimeout: 30000 
-  });
+// 🛑 RESTORED: Config Persistence Endpoint
+app.post('/api/v1/config/save', async (req, res) => {
+  await redis.setex(`config:${req.body.user}`, REDIS_TTL, JSON.stringify(req.body));
+  res.json({ status: 'PERSISTED' });
+});
 
-  // 🛑 CRITICAL FIX: Global Error Handler
-  // This prevents the "Unhandled 'error' event" crash
-  client.on('error', (err) => {
-    console.error(`[IMAP BACKGROUND ERROR] ${config.user}:`, err.message);
-    // We don't throw here, just log. The sync loop will catch the disconnect.
-  });
-
-  await client.connect();
-  activeClients.set(config.user, client);
-  return client;
-};
-
-async function streamToString(stream: any): Promise<string> {
-  const chunks = [];
-  for await (const chunk of stream) chunks.push(chunk);
-  return Buffer.concat(chunks).toString('utf-8');
-}
-
-function getDomainCandidates(domain: string): string[] {
-  const parts = domain.toLowerCase().split('.');
-  if (parts.length <= 2) return [domain];
-  const candidates = [domain];
-  const commonTldParts = ['com', 'org', 'net', 'gov', 'edu', 'co', 'asn', 'id', 'info', 'biz'];
-  const isThreePartSuffix = parts.length >= 3 && commonTldParts.includes(parts[parts.length - 2]);
-  if (isThreePartSuffix) {
-    if (parts.length > 3) candidates.push(parts.slice(-3).join('.'));
-  } else {
-    if (parts.length > 2) candidates.push(parts.slice(-2).join('.'));
-  }
-  return Array.from(new Set(candidates));
-}
-
-async function resolveBrandLogo(domain: string): Promise<{ data: Buffer, contentType: string }> {
-  const cacheKey = `logo_meta:${domain}`;
-  const filePath = path.join(LOGO_CACHE_DIR, `${domain}.png`);
-  const cachedMeta = await redis.get(cacheKey);
-  if (cachedMeta) {
-    try {
-      const { contentType } = JSON.parse(cachedMeta);
-      const data = await fs.readFile(filePath);
-      return { data, contentType };
-    } catch (e) { }
-  }
-  const logoToken = process.env.LOGO_DEV_KEY;
-  const candidates = getDomainCandidates(domain);
-  for (const candidate of candidates) {
-    const strategies = [
-      ...(logoToken ? [`https://img.logo.dev/${candidate}?token=${logoToken}&size=128`] : []),
-      `https://icons.duckduckgo.com/ip3/${candidate}.ico`,
-      `https://www.google.com/s2/favicons?domain=${candidate}&sz=128`
-    ];
-    for (const url of strategies) {
-      try {
-        const response = await fetch(url, { signal: AbortSignal.timeout(4000) });
-        if (response.ok) {
-          // 🛑 FIX: Use arrayBuffer instead of buffer()
-          const arrayBuf = await response.arrayBuffer();
-          const buffer = Buffer.from(arrayBuf);
-          
-          const contentType = response.headers.get('content-type') || 'image/png';
-          if (buffer.length > 500 || url.includes('google.com') || url.includes('duckduckgo')) {
-            await fs.writeFile(filePath, buffer);
-            await redis.setex(cacheKey, REDIS_TTL * 30, JSON.stringify({ contentType }));
-            return { data: buffer, contentType };
-          }
-        }
-      } catch (e) { }
-    }
-  }
-  
-  const fallbackSvg = `
-    <svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
-      <rect width="128" height="128" rx="30" fill="#e2e8f0"/>
-      <text x="50%" y="50%" dy=".35em" fill="#94a3b8" font-family="sans-serif" font-size="64" text-anchor="middle" font-weight="bold">
-        ${domain.charAt(0).toUpperCase()}
-      </text>
-    </svg>
-  `;
-  return { data: Buffer.from(fallbackSvg), contentType: 'image/svg+xml' };
-}
-
-app.get('/api/v1/health', (req, res) => {
-  res.json({ status: 'UP', timestamp: Date.now() });
+// 🛑 RESTORED: Sync Status Endpoint
+app.get('/api/v1/sync/status', async (req, res) => {
+  const prog = await redis.get(`sync_progress:${req.query.user}`);
+  const queue = getQueue(req.query.user as string);
+  const stats = queue.getStats();
+  const base = prog ? JSON.parse(prog) : { percent: 0, status: 'IDLE' };
+  base.queue = stats;
+  res.json(base);
 });
 
 app.get('/api/v1/proxy/logo', async (req, res) => {
@@ -178,10 +59,77 @@ app.get('/api/v1/proxy/logo', async (req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=2592000, immutable');
     res.send(result.data);
   } catch (e) { 
-    const result = await resolveBrandLogo('unknown'); 
-    res.setHeader('Content-Type', result.contentType);
-    res.send(result.data);
+    res.setHeader('Content-Type', 'image/gif');
+    res.send(TRANSPARENT_PIXEL);
   }
+});
+
+app.get('/api/v1/proxy/brand-name', async (req, res) => {
+    const domain = req.query.domain as string;
+    if (!domain) return res.status(400).json({ name: null });
+    const name = await resolveBrandName(domain);
+    res.json({ name });
+});
+
+app.post('/api/v1/mail/sync', async (req, res) => {
+  const { user } = req.body;
+  if (syncLocks.get(user)) return res.json({ status: 'SYNC_IN_PROGRESS' });
+  
+  syncLocks.set(user, true);
+  await redis.setex(`sync_active:${user}`, 30, '1');
+  
+  startWorkerSwarm(req.body);
+  
+  (async () => {
+    try {
+        const getClient = async (cfg: any) => {
+            if (activeClients.has(cfg.user)) return activeClients.get(cfg.user)!;
+            const client = new ImapFlow({
+                host: cfg.imapHost, port: cfg.imapPort, secure: cfg.useTLS || cfg.imapPort === 993,
+                auth: { user: cfg.user, pass: cfg.pass }, logger: false, clientTimeout: 60000, 
+            });
+            await client.connect();
+            activeClients.set(cfg.user, client);
+            return client;
+        };
+        const client = await getClient(req.body);
+        const count = await EmailModel.countDocuments({ user });
+        if (count < 200) await runFullSync(client, user); else await runQuickSync(client, user);
+    } catch (e) { console.error("Sync Error", e); }
+    finally { syncLocks.delete(user); syncCooldowns.set(user, Date.now()); }
+  })();
+  res.json({ status: 'SYNC_PIPELINE_INITIATED' });
+});
+
+app.get('/api/v1/mail/list', async (req, res) => {
+  const { user, folder } = req.query;
+  const targetFolder = (folder as string) || 'Inbox';
+  const listKey = `mail:${user}:list:${targetFolder}`;
+  const isLiveMode = await redis.get(`sync_active:${user}`);
+  let listData = null;
+  if (!isLiveMode) {
+      const cached = await redis.get(listKey);
+      if (cached) listData = JSON.parse(cached);
+  }
+  if (!listData) {
+    listData = await EmailModel.find({ user, folder: targetFolder }).sort({ timestamp: -1 }).limit(100).lean();
+    if (listData.length > 0 && !isLiveMode) await redis.setex(listKey, REDIS_TTL, JSON.stringify(listData));
+  }
+  if (listData && listData.length > 0) preWarmCache(listData, user as string);
+  res.json(listData);
+});
+
+app.get('/api/v1/mail/:id', async (req, res) => {
+  const { id } = req.params;
+  const { user } = req.query;
+  const cacheKey = `mail_obj:${id}:${user}`;
+  const l1 = await redis.get(cacheKey);
+  if (l1) { const data = JSON.parse(l1); if (data.isFullBody) return res.json({ email: data, source: 'Redis' }); }
+  const l2 = await EmailModel.findOne({ id, user });
+  if (l2 && l2.isFullBody) { await redis.setex(cacheKey, REDIS_TTL, JSON.stringify(l2)); return res.json({ email: l2, source: 'MongoDB' }); }
+  const queue = getQueue(user as string);
+  if (l2) queue.add({ id: l2.id, priority: 1, addedAt: 0, data: { uid: l2.uid!, folder: l2.folder || 'Inbox', user: user as string }, attempts: 0 });
+  res.status(408).json({ error: 'Fetch timed out - Worker busy' });
 });
 
 app.get('/api/v1/proxy/image', async (req, res) => {
@@ -191,30 +139,23 @@ app.get('/api/v1/proxy/image', async (req, res) => {
   const cacheKey = `img_meta:${urlHash}`;
   const filePath = path.join(CACHE_DIR, urlHash);
   const cachedMeta = await redis.get(cacheKey);
-  
   if (cachedMeta) {
     try {
       const { contentType } = JSON.parse(cachedMeta);
       const data = await fs.readFile(filePath);
       res.setHeader('Content-Type', contentType);
-      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
       return res.send(data);
     } catch (e) { }
   }
   try {
     const response = await fetch(targetUrl, { signal: AbortSignal.timeout(15000) });
     if (!response.ok) throw new Error(`Status ${response.status}`);
-    
-    // 🛑 FIX: Use arrayBuffer instead of buffer()
     const arrayBuf = await response.arrayBuffer();
     const buffer = Buffer.from(arrayBuf);
-    
     const contentType = response.headers.get('content-type') || 'image/jpeg';
     await fs.writeFile(filePath, buffer);
     await redis.setex(cacheKey, REDIS_TTL * 7, JSON.stringify({ contentType }));
-    
     res.setHeader('Content-Type', contentType);
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     res.send(buffer);
   } catch (e) {
     res.setHeader('Content-Type', 'image/gif');
@@ -224,292 +165,46 @@ app.get('/api/v1/proxy/image', async (req, res) => {
 
 app.delete('/api/v1/debug/reset', async (req, res) => {
   try {
+    userWorkers.clear(); 
+    activeClients.forEach(c => { try { c.logout(); } catch(e){} });
+    activeClients.clear();
     await redis.flushall();
     await EmailModel.deleteMany({});
-    const dirs = [CACHE_DIR, LOGO_CACHE_DIR];
-    for(const dir of dirs) {
-      try {
-        const files = await fs.readdir(dir);
-        for (const file of files) {
-          const p = path.join(dir, file);
-          const stat = await fs.lstat(p);
-          if (stat.isFile()) await fs.unlink(p);
-        }
-      } catch (e) {}
-    }
-    activeClients.forEach(c => c.logout());
-    activeClients.clear();
+    syncLocks.clear();
+    syncCooldowns.clear();
     res.json({ status: 'SYSTEM_WIPED' });
   } catch (e) { res.status(500).json({ error: 'WIPE_FAILED' }); }
 });
 
-app.post('/api/v1/config/save', async (req, res) => {
-  await redis.setex(`config:${req.body.user}`, REDIS_TTL, JSON.stringify(req.body));
-  res.json({ status: 'PERSISTED' });
-});
-
-app.get('/api/v1/sync/status', async (req, res) => {
-  const prog = await redis.get(`sync_progress:${req.query.user}`);
-  res.json(prog ? JSON.parse(prog) : { percent: 0, status: 'IDLE' });
-});
-
-async function preWarmCache(emails: any[], user: string) {
-  if (!emails || emails.length === 0) return;
-  
-  process.nextTick(async () => {
-    const keys = emails.map(e => `mail_obj:${e.id}:${user}`);
-    const exists = await redis.mget(keys);
-    
-    const missingIds: string[] = [];
-    exists.forEach((val, idx) => {
-      if (!val) missingIds.push(emails[idx].id);
+app.get('/api/v1/debug/workers', (req, res) => {
+    res.json({
+        workers: workerState.map(w => ({ ...w, ageMs: w.status === 'WORKING' ? Date.now() - w.lastActivity : 0 })),
+        system: systemStats,
+        locks: Array.from(syncLocks.keys()),
+        timestamp: Date.now()
     });
-
-    if (missingIds.length === 0) return;
-
-    const docs = await EmailModel.find({ 
-      id: { $in: missingIds }, 
-      user 
-    }).lean();
-
-    if (docs.length > 0) {
-      const pipeline = redis.pipeline();
-      docs.forEach(doc => {
-        pipeline.setex(`mail_obj:${doc.id}:${user}`, REDIS_TTL, JSON.stringify(doc));
-      });
-      await pipeline.exec();
-      console.log(`🔥 Auto-Warmed ${docs.length} emails into Redis for ${user}`);
-    }
-  });
-}
-
-app.post('/api/v1/mail/sync', async (req, res) => {
-  const { user } = req.body;
-  (async () => {
-    try {
-      await redis.setex(`sync_progress:${user}`, 300, JSON.stringify({ percent: 0, status: 'BURST' }));
-      const client = await getClient(req.body);
-      
-      // 🛑 STABILITY: Try/Catch the lock acquisition separately
-      let lock;
-      try {
-        lock = await client.getMailboxLock('INBOX');
-      } catch (e) {
-        console.error("Failed to acquire lock:", e);
-        throw e; // Rethrow to trigger the outer catch
-      }
-
-      try {
-        await runFullSync(client, user);
-      } finally { 
-        if (lock) lock.release(); 
-      }
-    } catch (e: any) { 
-      console.error("Sync pipeline error:", e);
-      
-      // 🛑 NOTIFICATION: Explicitly set status to ERROR so frontend knows
-      let errorStatus = 'ERROR';
-      if (e.responseText && e.responseText.includes('Failure')) errorStatus = 'ERROR'; // Auth Failure
-      
-      await redis.setex(`sync_progress:${user}`, 300, JSON.stringify({ percent: 0, status: errorStatus }));
-    }
-  })();
-  res.json({ status: 'SYNC_PIPELINE_INITIATED' });
 });
 
-app.get('/api/v1/mail/list', async (req, res) => {
-  const { user, folder } = req.query;
-  const listKey = `mail:${user}:list:${folder || 'Inbox'}`;
-  
-  // 🛑 FEATURE: If sync is in ERROR state, should we block?
-  // The user requested "no email updated to browser".
-  // However, blocking here prevents viewing OLD mail. 
-  // We will handle the "Hide View" logic in the Frontend for better UX,
-  // but we can also flag the response here if needed.
-  
-  let listData = null;
-
-  const cached = await redis.get(listKey);
-  if (cached) {
-    listData = JSON.parse(cached);
-  } else {
-    listData = await EmailModel.find({ user, folder: folder || 'Inbox' })
-      .sort({ timestamp: -1 })
-      .limit(100)
-      .lean();
-      
-    if (listData.length > 0) {
-      await redis.setex(listKey, REDIS_TTL, JSON.stringify(listData));
-    }
-  }
-
-  if (listData && listData.length > 0) {
-    preWarmCache(listData, user as string);
-  }
-
-  res.json(listData);
+// 🛑 RESTORED: Monitor UI
+app.get('/monitor', (req, res) => {
+    res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Mailboy Console</title><style>body{background:#0f172a;color:#e2e8f0;font-family:'Courier New',monospace;padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:20px}.card{background:#1e293b;padding:15px;border-radius:8px;border:1px solid #334155}.card.working{border-color:#22c55e;box-shadow:0 0 10px rgba(34,197,94,0.2)}.card.error{border-color:#ef4444}h1{font-size:1.5rem;margin-bottom:10px;color:#38bdf8}.stat-val{font-size:1.5rem;font-weight:bold}.stat-label{color:#94a3b8;font-size:0.8rem}</style></head><body><div style="display:flex;justify-content:space-between;align-items:center;"><h1>⚡ Mailboy Swarm</h1><div id="clock">--:--:--</div></div><div class="grid"><div class="card"><div class="stat-val" id="jobsCompleted">0</div><div class="stat-label">Jobs Done</div></div><div class="card"><div class="stat-val" id="queueSize">0</div><div class="stat-label">Queue</div></div><div class="card"><div class="stat-val" id="activeLocks">0</div><div class="stat-label">Active Syncs</div></div></div><h3>Workers</h3><div class="grid" id="workerGrid"></div><script>function update(){fetch('/api/v1/debug/workers').then(r=>r.json()).then(data=>{document.getElementById('jobsCompleted').innerText=data.system.jobsCompleted;document.getElementById('queueSize').innerText=data.queue?.pending||0;document.getElementById('activeLocks').innerText=data.locks.length;const grid=document.getElementById('workerGrid');grid.innerHTML=data.workers.map(w=>{const statusClass=w.status==='WORKING'?'working':(w.status==='ERROR'?'error':'');return \`<div class="card \${statusClass}"><div><strong>Worker \${w.id}</strong></div><div style="color:\${w.status==='WORKING'?'#4ade80':'#64748b'}">\${w.status}</div>\${w.status==='WORKING'?\`<div style="font-size:0.75rem;margin-top:5px;word-break:break-all;">\${w.jobId}</div><div style="font-size:0.75rem;color:#facc15;">\${(w.ageMs/1000).toFixed(1)}s</div><div style="font-size:0.75rem;color:#94a3b8;">📂 \${w.folder}</div>\`:''}</div>\`}).join('');document.getElementById('clock').innerText=new Date().toLocaleTimeString()})}setInterval(update,1000);update();</script></body></html>`);
 });
 
-app.get('/api/v1/mail/:id', async (req, res) => {
-  const { id } = req.params;
-  const { user } = req.query;
-  const cacheKey = `mail_obj:${id}:${user}`;
-  
-  const l1 = await redis.get(cacheKey);
-  if (l1) return res.json({ email: JSON.parse(l1), source: 'Redis' });
-  
-  const l2 = await EmailModel.findOne({ id, user });
-  if (l2) {
-    await redis.setex(cacheKey, REDIS_TTL, JSON.stringify(l2));
-    return res.json({ email: l2, source: 'MongoDB' });
-  }
-  
-  const configStr = await redis.get(`config:${user}`);
-  if (!configStr) return res.status(401).json({ error: 'AUTH_REQUIRED' });
-  
-  try {
-    const client = await getClient(JSON.parse(configStr));
-    const uid = id.replace('uid-', '');
-    const msg = await client.fetchOne(uid, { bodyStructure: true, envelope: true }, { uid: true });
-    if (!msg) return res.status(404).json({ error: 'MESSAGE_NOT_FOUND' });
-    const partId = findBestPart(msg.bodyStructure);
-    const { content } = await client.download(uid, partId, { uid: true });
-    let body = await streamToString(content);
-    body = body.replace(/src=["'](https?:\/\/[^"']+)["']/gi, (match, url) => `src="/api/v1/proxy/image?url=${encodeURIComponent(url)}"`);
-    
-    const email = await EmailModel.findOneAndUpdate(
-      { id, user }, 
-      { body }, 
-      { new: true, upsert: true }
-    );
-    
-    await redis.del(`mail:${user}:list:${email.folder || 'Inbox'}`);
-    await redis.setex(cacheKey, REDIS_TTL, JSON.stringify(email));
-    
-    return res.json({ email, source: 'IMAP' });
-  } catch (e) { res.status(500).json({ error: 'REMOTE_FETCH_FAILED' }); }
-});
-
-function findBestPart(node: any): string | null {
-  const findHtml = (n: any): string | null => {
-    if (n.type === 'text/html') return n.part;
-    if (n.childNodes) for (const child of n.childNodes) { const res = findHtml(child); if (res) return res; }
-    return null;
-  };
-  const findText = (n: any): string | null => {
-    if (n.type === 'text/plain') return n.part;
-    if (n.childNodes) for (const child of n.childNodes) { const res = findText(child); if (res) return res; }
-    return null;
-  };
-  return findHtml(node) || findText(node) || '1';
-}
-
-async function runFullSync(client: ImapFlow, user: string) {
-  const mailbox = client.mailbox;
-  if (!mailbox) return;
-  
-  const range = `${Math.max(1, mailbox.exists - 50)}:${mailbox.exists}`;
-  
-  const uids: number[] = [];
-  for await (let msg of client.fetch(range, { uid: true })) {
-    uids.push(msg.uid);
-  }
-  uids.reverse(); 
-
-  const BATCH_SIZE = 5;
-  let processedCount = 0;
-
-  for (let i = 0; i < uids.length; i += BATCH_SIZE) {
-    const batchUids = uids.slice(i, i + BATCH_SIZE);
-    
-    await Promise.allSettled(batchUids.map(async (uid) => {
-      try {
-        const id = `uid-${uid}`;
-        
-        const exists = await EmailModel.exists({ id, user, body: { $ne: "" } });
-        if (exists) return;
-
-        const msg = await client.fetchOne(uid.toString(), { envelope: true, bodyStructure: true, flags: true }, { uid: true });
-        if (!msg) return;
-
-        const partId = findBestPart(msg.bodyStructure);
-        const { content } = await client.download(uid.toString(), partId, { uid: true });
-        let body = await streamToString(content);
-        
-        body = body.replace(/src=["'](https?:\/\/[^"']+)["']/gi, (match, url) => `src="/api/v1/proxy/image?url=${encodeURIComponent(url)}"`);
-
-        const savedDoc = await EmailModel.findOneAndUpdate(
-          { id, user },
-          {
-            uid,
-            from: msg.envelope.from?.[0]?.address || 'unknown',
-            to: msg.envelope.to?.[0]?.address || user,
-            subject: msg.envelope.subject || '(No Subject)',
-            timestamp: new Date(msg.envelope.date || Date.now()).getTime(),
-            read: msg.flags.has('\\Seen'),
-            folder: 'Inbox',
-            body: body 
-          },
-          { upsert: true, new: true }
-        );
-
-        if (savedDoc) {
-          await redis.setex(`mail_obj:${id}:${user}`, REDIS_TTL, JSON.stringify(savedDoc));
-        }
-
-      } catch (e) {
-        console.error(`Sync error on UID ${uid}:`, e);
-      }
-    }));
-
-    processedCount += batchUids.length;
-    
-    await redis.del(`mail:${user}:list:Inbox`);
-    
-    await redis.setex(`sync_progress:${user}`, 300, JSON.stringify({ 
-      percent: Math.round((processedCount / uids.length) * 100), 
-      status: 'HYDRATING' 
-    }));
-  }
-
-  const final_list = await EmailModel.find({ user, folder: 'Inbox' }).sort({ timestamp: -1 }).limit(100);
-  await redis.setex(`mail:${user}:list:Inbox`, REDIS_TTL, JSON.stringify(final_list));
-  await redis.setex(`sync_progress:${user}`, 300, JSON.stringify({ percent: 100, status: 'STABLE' }));
-}
-
-// ----------------------------------------
-// 🚀 DOCKER STATIC FILE SERVING (Compatible with Express 5)
-// ----------------------------------------
 const distPath = path.join(__dirname, 'dist');
 app.use(express.static(distPath));
-
-// Handle Client-Side Routing (SPA Fallback)
 app.get(/(.*)/, (req, res) => {
   if (req.path.startsWith('/api')) return res.status(404).json({ error: 'API route not found' });
   res.sendFile(path.join(distPath, 'index.html'));
 });
 
-// ----------------------------------------
-// 🚀 DUAL MODE: HTTP + HTTPS LISTENERS
-// ----------------------------------------
-
-// 1. Start Standard HTTP Server (Port 3001)
 const HTTP_PORT = 3001;
-app.listen(HTTP_PORT, '0.0.0.0', () => {
-  console.log(`🚀 MAILBOY HTTP ONLINE: http://localhost:${HTTP_PORT}`);
-});
+app.listen(HTTP_PORT, '0.0.0.0', () => { console.log(`🚀 MAILBOY HTTP ONLINE: http://localhost:${HTTP_PORT}`); });
 
-// 2. Start Secure HTTPS Server (Port 3002) - Fails gracefully if no certs
 try {
   const httpsOptions = {
     key: fsSync.readFileSync(path.join(__dirname, 'server.key')),
     cert: fsSync.readFileSync(path.join(__dirname, 'server.cert'))
   };
-  
   const HTTPS_PORT = 3002;
-  https.createServer(httpsOptions, app).listen(HTTPS_PORT, '0.0.0.0', () => {
-    console.log(`🔒 MAILBOY HTTPS ONLINE: https://localhost:${HTTPS_PORT}`);
-  });
-} catch (e) {
-  console.log("⚠️ HTTPS skipped: server.key or server.cert not found in /app");
-}
+  https.createServer(httpsOptions, app).listen(HTTPS_PORT, '0.0.0.0', () => { console.log(`🔒 MAILBOY HTTPS ONLINE: https://localhost:${HTTPS_PORT}`); });
+} catch (e) { console.log("⚠️ HTTPS skipped: server.key or server.cert not found in /app"); }

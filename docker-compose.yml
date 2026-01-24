@@ -1,39 +1,38 @@
-version: '3.8'
-
 services:
-  mailboy:
-    build: .
+  app:
+    image: mailboy
     container_name: mailboy_app
-    restart: always
-    network_mode: "host" # <--- BYPASS: Use LXC network directly
+    build: .
+    restart: unless-stopped
+    network_mode: "host"
     environment:
-      # Since we share the network, services are now on 'localhost'
       - MONGODB_URI=mongodb://127.0.0.1:27017/mailboy
-      - REDIS_URL=redis://127.0.0.1:6379
+      # 🛑 UPDATE: Pointing to the new safe port
+      - REDIS_URL=redis://127.0.0.1:6380
       - NODE_ENV=production
+      - LOGO_DEV_KEY=${LOGO_DEV_KEY}
     depends_on:
       - mongo
       - redis
     volumes:
       - ./img_cache:/app/img_cache
-      # Mount the certificates
-      - ./server.key:/app/server.key
-      - ./server.cert:/app/server.cert
+      - ./.env:/app/.env
 
   mongo:
     image: mongo:6
     container_name: mailboy_mongo
-    restart: always
-    network_mode: "host" # <--- BYPASS
+    restart: unless-stopped
+    network_mode: "host"
     volumes:
       - mongo_data:/data/db
 
   redis:
     image: redis:alpine
     container_name: mailboy_redis
-    restart: always
-    network_mode: "host" # <--- BYPASS
-    command: redis-server --save 60 1 --loglevel warning
+    restart: unless-stopped
+    network_mode: "host"
+    # 🛑 COMMAND: Force Redis to listen on 6380
+    command: redis-server --port 6380
     volumes:
       - redis_data:/data
 

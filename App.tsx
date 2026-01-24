@@ -263,7 +263,13 @@ const App: React.FC = () => {
                         </button>
                       </div>
                     )}
-                    <EmailList emails={emails} onSelect={handleSelectEmail} isLoading={isLoading} />
+                    {/* 🛑 UPDATED: Added onRefresh prop */}
+                    <EmailList 
+                        emails={emails} 
+                        onSelect={handleSelectEmail} 
+                        isLoading={isLoading} 
+                        onRefresh={refreshList} 
+                    />
                   </>
                 )}
 

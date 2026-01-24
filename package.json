@@ -9,23 +9,25 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "react": "^19.2.3",
-    "react-dom": "^19.2.3",
     "buffer": "^6.0.3",
-    "isomorphic-dompurify": "^2.20.0",
+    "cors": "^2.8.5",
+    "crypto": "^1.0.1",
     "express": "^5.2.1",
+    "fs": "^0.0.1-security",
+    "html-to-text": "^9.0.5",
     "imapflow": "^1.2.6",
     "ioredis": "^5.9.2",
+    "isomorphic-dompurify": "^2.20.0",
     "mongoose": "^9.1.4",
-    "cors": "^2.8.5",
     "node-fetch": "^3.3.2",
-    "fs": "^0.0.1-security",
     "path": "^0.12.7",
-    "crypto": "^1.0.1"
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
     "@vitejs/plugin-react": "^5.0.0",
+    "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"
   }
