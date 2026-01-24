@@ -42,7 +42,7 @@ This is the recommended way to run Mailboy. It spins up the App, Redis, and Mong
 
 ### 2. Clone & Run
 ```bash
-git clone [https://github.com/YOUR_USERNAME/mailboy.git](https://github.com/YOUR_USERNAME/mailboy.git)
+git clone [https://github.com/highkick05/mailboy.git](https://github.com/YOUR_USERNAME/mailboy.git)
 cd mailboy
 
 # Start the system (builds images if missing)
