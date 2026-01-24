@@ -1,9 +1,9 @@
-import { Email, EmailFolder, CacheStats, MailConfig } from '../types';
+import { Email, EmailFolder, CacheStats, MailConfig, Label, SmartRule } from '../types';
 
 class HybridMailService {
   private config: MailConfig | null = null;
   
-  // 🛑 FIX: Use relative path so it works on both HTTP (3001) and HTTPS (3002)
+  // Use relative path so it works on both HTTP (3001) and HTTPS (3002)
   public get API_BASE() {
     return '/api/v1';
   }
@@ -35,7 +35,7 @@ class HybridMailService {
     } catch { return { status: 'IDLE' }; }
   }
 
-  // 🛑 ADDED: Missing method required by App.tsx for auto-hydration
+  // Required by App.tsx for auto-hydration
   async triggerHydration(): Promise<void> {
     if (!this.config) return;
     try {
@@ -88,26 +88,61 @@ class HybridMailService {
     };
   }
 
-  async getAllEmails(folder: EmailFolder = 'Inbox'): Promise<Email[]> {
+  // 🛑 UPDATED: Support Category Filtering
+  async getAllEmails(folder: string | EmailFolder = 'Inbox', category?: string): Promise<Email[]> {
     if (!this.config) return [];
     try {
-      const response = await fetch(`${this.API_BASE}/mail/list?folder=${folder}&user=${encodeURIComponent(this.config.user)}`);
+      // If filtering Inbox, pass category (default to 'primary'). Else 'all'.
+      const catParam = (folder === 'Inbox') ? (category || 'primary') : 'all';
+      
+      const response = await fetch(`${this.API_BASE}/mail/list?folder=${folder}&category=${catParam}&user=${encodeURIComponent(this.config.user)}`);
       if (!response.ok) return [];
       return await response.json();
     } catch { return []; }
   }
 
-  // 🛑 NEW: Mark email as Read
-  async markAsRead(id: string, user: string): Promise<void> {
-    try {
-      await fetch(`${this.API_BASE}/mail/mark`, {
+  // 🛑 NEW: Smart Rules Management
+  async getSmartRules(): Promise<SmartRule[]> {
+      if (!this.config) return [];
+      try {
+        const res = await fetch(`${this.API_BASE}/smart-rules?user=${encodeURIComponent(this.config.user)}`);
+        return res.ok ? await res.json() : [];
+      } catch { return []; }
+  }
+
+  async addSmartRule(category: string, value: string, type: 'from' | 'subject' = 'from'): Promise<SmartRule | null> {
+      if (!this.config) return null;
+      try {
+        const res = await fetch(`${this.API_BASE}/smart-rules`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user: this.config.user, category, value, type })
+        });
+        return res.ok ? await res.json() : null;
+      } catch { return null; }
+  }
+
+  async deleteSmartRule(id: string): Promise<boolean> {
+      if (!this.config) return false;
+      try {
+        const res = await fetch(`${this.API_BASE}/smart-rules/${id}?user=${encodeURIComponent(this.config.user)}`, { method: 'DELETE' });
+        return res.ok;
+      } catch { return false; }
+  }
+
+  async markAsRead(id: string, read: boolean): Promise<void> {
+    if (!this.config) return;
+    await fetch(`${this.API_BASE}/mail/mark`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id, user, read: true })
-      });
-    } catch (e) {
-      console.error("Failed to mark as read", e);
-    }
+        body: JSON.stringify({ id, read, user: this.config.user })
+    });
+  }
+
+  async batchMarkRead(ids: string[], read: boolean): Promise<void> {
+      if (!this.config || ids.length === 0) return;
+      const promises = ids.map(id => this.markAsRead(id, read));
+      await Promise.all(promises);
   }
 
   async relaySmtp(email: Omit<Email, 'id' | 'timestamp' | 'read' | 'folder'>): Promise<{ email: Email; log: string }> {
@@ -121,6 +156,69 @@ class HybridMailService {
     const result = await response.json();
     return { email: result.email, log: `SMTP_SUCCESS: Relay confirmed.` };
   }
+  
+  // Label Management
+  async getLabels(): Promise<Label[]> {
+    if (!this.config) return [];
+    try {
+      const res = await fetch(`${this.API_BASE}/labels?user=${encodeURIComponent(this.config.user)}`);
+      return res.ok ? await res.json() : [];
+    } catch { return []; }
+  }
+
+  async createLabel(name: string, color: string): Promise<Label | null> {
+    if (!this.config) return null;
+    try {
+      const res = await fetch(`${this.API_BASE}/labels`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user: this.config.user, name, color })
+      });
+      return res.ok ? await res.json() : null;
+    } catch { return null; }
+  }
+
+  async deleteLabel(id: string): Promise<boolean> {
+    if (!this.config) return false;
+    try {
+      const res = await fetch(`${this.API_BASE}/labels/${id}?user=${encodeURIComponent(this.config.user)}`, {
+        method: 'DELETE'
+      });
+      return res.ok;
+    } catch { return false; }
+  }
+
+  async toggleLabel(emailId: string, labelId: string, action: 'add' | 'remove'): Promise<void> {
+    if (!this.config) return;
+    await fetch(`${this.API_BASE}/mail/label`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user: this.config.user, emailId, labelId, action })
+    });
+  }
+  
+  async moveEmail(emailId: string, targetFolder: string): Promise<boolean> {
+    if (!this.config) return false;
+    try {
+      const res = await fetch(`${this.API_BASE}/mail/move`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+            user: this.config.user, 
+            emailId, 
+            targetFolder 
+        })
+      });
+      return res.ok;
+    } catch { return false; }
+  }
+  
+  async deleteEmails(ids: string[]): Promise<void> {
+    if (!this.config || ids.length === 0) return;
+    const promises = ids.map(id => this.moveEmail(id, 'Trash'));
+    await Promise.all(promises);
+  }
+
 }
 
 export const mailService = new HybridMailService();

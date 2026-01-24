@@ -1,10 +1,13 @@
 import { ImapFlow } from 'imapflow';
 import { Buffer } from 'buffer';
 import { convert } from 'html-to-text';
-import { redis, EmailModel, UserConfigModel } from './db';
+import { redis, EmailModel, UserConfigModel, SmartRuleModel } from './db';
 
 const BG_WORKER_COUNT = 10;
 const REDIS_TTL = 86400;
+
+// 🛑 NEW: System State Flag (The Kill Switch)
+let isSystemRunning = true;
 
 export const workerState = new Array(BG_WORKER_COUNT).fill(null).map((_, i) => ({
     id: i, status: 'IDLE', jobId: '', folder: '', duration: 0, lastActivity: Date.now()
@@ -16,6 +19,35 @@ let connectionBackoffUntil = 0;
 
 export const userWorkers = new Map<string, boolean>();
 export const activeClients = new Map<string, ImapFlow>();
+
+// 🛑 NEW: Kill Swarm Function
+export const killSwarm = async () => {
+    console.log("☠️ KILL SWITCH ENGAGED: Stopping all workers...");
+    isSystemRunning = false; // Prevent new loops
+
+    // 1. Clear all user worker flags
+    userWorkers.clear();
+
+    // 2. Logout all IMAP clients
+    for (const [user, client] of activeClients.entries()) {
+        try {
+            console.log(`🔌 Disconnecting ${user}...`);
+            await client.logout();
+        } catch (e) {
+            client.close(); // Force close if logout fails
+        }
+    }
+    activeClients.clear();
+    
+    // 3. Reset Locks
+    syncLocks.clear();
+    syncCooldowns.clear();
+    
+    console.log("✅ SWARM DESTROYED.");
+    
+    // Allow restart after a brief pause (optional, or require manual restart)
+    setTimeout(() => { isSystemRunning = true; }, 1000);
+};
 
 interface Job { id: string; priority: number; data: any; addedAt: number; attempts: number; }
 class JobQueue {
@@ -77,10 +109,12 @@ export async function getFolderMap(client: ImapFlow, user: string): Promise<Reco
 }
 
 export async function startWorkerSwarm(config: any) {
+    if (!isSystemRunning) return; // 🛑 Check Lock
     if (userWorkers.has(config.user)) return; 
     userWorkers.set(config.user, true);
     console.log(`🚀 Spawning ${BG_WORKER_COUNT} Workers for ${config.user}`);
     for (let i = 0; i < BG_WORKER_COUNT; i++) {
+        if (!isSystemRunning) break; // 🛑 Stop spawning if kill switch hit
         runWorker(i, config).catch(e => console.error(`Worker ${i} died:`, e));
         await new Promise(r => setTimeout(r, 500)); 
     }
@@ -93,6 +127,7 @@ async function runWorker(workerId: number, config: any) {
     let lastActionTime = Date.now();
 
     const connect = async () => {
+        if (!isSystemRunning) return false; // 🛑 Check Lock
         if (!userWorkers.has(config.user)) return false; 
         if (Date.now() < connectionBackoffUntil) { updateWorkerState(workerId, 'COOLDOWN'); return false; }
         try {
@@ -118,7 +153,7 @@ async function runWorker(workerId: number, config: any) {
 
     await connect();
 
-    while (true) {
+    while (isSystemRunning) { // 🛑 Loop condition now checks system state
         if (!userWorkers.has(config.user)) { 
             if (client) try { client.close(); } catch(e) {}
             updateWorkerState(workerId, 'TERMINATED');
@@ -151,12 +186,10 @@ async function runWorker(workerId: number, config: any) {
             const exists = await EmailModel.findOne({ id: job.id }, { isFullBody: 1 });
             if (exists && exists.isFullBody) { queue.done(job.id); continue; }
 
-            // 🛑 CHANGED: Added `peek: true` to prevent marking as read when fetching body
             const msg = await client.fetchOne(job.data.uid.toString(), { bodyStructure: true }, { uid: true });
             if (!msg) throw new Error("Msg not found");
 
             const partId = findBestPart(msg.bodyStructure);
-            // 🛑 CHANGED: Download with `peek: true` implies we don't change flags
             const downloadResult = await client.download(job.data.uid.toString(), partId, { uid: true, peek: true });
             if (!downloadResult || !downloadResult.content) throw new Error("Empty content");
 
@@ -192,23 +225,63 @@ function safeTimestamp(date: any): number {
     return isNaN(ts) ? Date.now() : ts;
 }
 
+// 🛑 NEW: Helper to fetch user Smart Rules
+async function getUserRules(user: string) {
+    const cacheKey = `smart_rules:${user}`;
+    const cached = await redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+
+    const rules = await SmartRuleModel.find({ user }).lean();
+    await redis.setex(cacheKey, 3600, JSON.stringify(rules)); // Cache for 1 hour
+    return rules;
+}
+
+// 🛑 NEW: Classifier Logic
+async function classifyEmail(msg: any, user: string): Promise<string> {
+    const rules = await getUserRules(user);
+    const from = (msg.envelope.from?.[0]?.address || "").toLowerCase();
+    const subject = (msg.envelope.subject || "").toLowerCase();
+
+    // 1. Check User Rules (High Priority)
+    for (const rule of rules) {
+        if (rule.type === 'from' && from.includes(rule.value.toLowerCase())) return rule.category;
+        if (rule.type === 'subject' && subject.includes(rule.value.toLowerCase())) return rule.category;
+    }
+
+    // 2. Hardcoded Fallbacks (Base Logic)
+    if (from.includes('facebook') || from.includes('twitter') || from.includes('linkedin') || from.includes('instagram')) return 'social';
+    if (from.includes('marketing') || from.includes('newsletter') || from.includes('no-reply') || from.includes('offer')) return 'promotions';
+    if (from.includes('receipt') || from.includes('billing') || from.includes('invoice') || from.includes('order')) return 'updates';
+
+    return 'primary';
+}
+
 export async function saveBatch(messages: any[], folder: string, user: string, queue: JobQueue) {
-    const ops = messages.map(msg => {
+    if (!isSystemRunning) return; // 🛑 Check Lock
+    
+    // 🛑 Pre-calculate categories for the batch
+    const classifiedData = await Promise.all(messages.map(async (msg) => {
+        return {
+            msg,
+            category: await classifyEmail(msg, user)
+        };
+    }));
+
+    const ops = classifiedData.map(({ msg, category }) => {
         const f = msg.envelope.from?.[0] || {};
         const cleanName = f.name || f.address || 'Unknown';
         const cleanAddr = f.address || 'unknown';
-        // 🛑 NEW: Capture Read Status correctly from flags
         const isRead = msg.flags.has('\\Seen');
 
         return {
             updateOne: {
                 filter: { id: `uid-${msg.uid}-${folder}`, user },
                 update: {
-                    // 🛑 NEW: Update 'read' status on every sync
                     $set: { 
                         timestamp: safeTimestamp(msg.envelope.date), 
                         read: isRead, 
-                        folder: folder 
+                        folder: folder,
+                        category: category // 🛑 Saving Category
                     },
                     $setOnInsert: { 
                         uid: msg.uid, 
@@ -236,6 +309,7 @@ export async function syncRangeAtomic(client: ImapFlow, range: string, folder: s
     let batch: any[] = [];
     let count = 0;
     for await (let msg of client.fetch(range, fetchOptions)) {
+        if (!isSystemRunning) break; // 🛑 Check Lock inside loop
         batch.push(msg);
         count++;
         if (batch.length >= (count === 1 ? 1 : batchSize)) { await saveBatch(batch, folder, user, queue); batch = []; }
@@ -244,6 +318,7 @@ export async function syncRangeAtomic(client: ImapFlow, range: string, folder: s
 }
 
 export async function runQuickSync(client: ImapFlow, user: string) {
+    if (!isSystemRunning) return; // 🛑 Check Lock
     const map = await getFolderMap(client, user);
     const inboxPath = map['Inbox'];
     const queue = getQueue(user);
@@ -255,7 +330,6 @@ export async function runQuickSync(client: ImapFlow, user: string) {
         const lock = await client.getMailboxLock(inboxPath);
         try {
             if (client.mailbox.exists === 0) return;
-            // 🛑 OPTIMIZATION: Check for flag updates on recent messages
             const range = `${Math.max(1, client.mailbox.exists - 50)}:${client.mailbox.exists}`;
             await syncRangeAtomic(client, range, 'Inbox', user, queue, 10);
         } finally { lock.release(); }
@@ -266,6 +340,7 @@ export async function runQuickSync(client: ImapFlow, user: string) {
 }
 
 export async function runFullSync(client: ImapFlow, user: string) {
+  if (!isSystemRunning) return; // 🛑 Check Lock
   const map = await getFolderMap(client, user);
   const foldersToSync = ['Inbox', 'Trash', 'Sent', 'Drafts', 'Spam'];
   const queue = getQueue(user);
@@ -273,6 +348,7 @@ export async function runFullSync(client: ImapFlow, user: string) {
   await redis.setex(`sync_progress:${user}`, 300, JSON.stringify({ status: 'HYDRATING', percent: 1 }));
 
   for (const standardName of foldersToSync) {
+    if (!isSystemRunning) break; // 🛑 Check Lock
     const realPath = map[standardName];
     if (!realPath) continue;
     try {
@@ -292,6 +368,7 @@ export async function runFullSync(client: ImapFlow, user: string) {
              await syncRangeAtomic(client, `1:${mailbox.exists}`, standardName, user, queue, 10);
         } else {
             for (let i = top; i > bottom; i -= batchSize) {
+                if (!isSystemRunning) break; // 🛑 Check Lock
                 const from = Math.max(bottom, i - batchSize + 1);
                 const to = i;
                 const range = `${from}:${to}`;
@@ -300,6 +377,7 @@ export async function runFullSync(client: ImapFlow, user: string) {
                     await syncRangeAtomic(client, range, standardName, user, queue, saveSize);
                 } catch (e) {
                    for (let j = to; j >= from; j -= 10) {
+                       if (!isSystemRunning) break;
                        const subFrom = Math.max(from, j - 9);
                        const subRange = `${subFrom}:${j}`;
                        try { await syncRangeAtomic(client, subRange, standardName, user, queue, 1); } catch (err2) {}
@@ -311,9 +389,11 @@ export async function runFullSync(client: ImapFlow, user: string) {
     } catch (e) { console.error(`Failed to sync folder ${standardName}:`, e); }
   }
   
-  await UserConfigModel.findOneAndUpdate({ user }, { setupComplete: true, lastSync: Date.now() });
-  await redis.setex(`sync_progress:${user}`, 60, JSON.stringify({ status: 'IDLE', percent: 100 }));
-  console.log(`🎉 FIRST SYNC COMPLETE for ${user}. Background sync enabled.`);
+  if (isSystemRunning) {
+      await UserConfigModel.findOneAndUpdate({ user }, { setupComplete: true, lastSync: Date.now() });
+      await redis.setex(`sync_progress:${user}`, 60, JSON.stringify({ status: 'IDLE', percent: 100 }));
+      console.log(`🎉 FIRST SYNC COMPLETE for ${user}. Background sync enabled.`);
+  }
 }
 
 function findBestPart(node: any): string | null {
@@ -353,6 +433,7 @@ export function preWarmCache(emails: any[], user: string) {
 }
 
 export async function spawnBackgroundClient(cfg: any) {
+    if (!isSystemRunning) return; // 🛑 Check Lock
     if (activeClients.has(cfg.user)) return;
     try {
         const client = new ImapFlow({
@@ -369,6 +450,7 @@ export async function spawnBackgroundClient(cfg: any) {
 }
 
 setInterval(() => {
+    if (!isSystemRunning) return; // 🛑 Check Lock
     if (activeClients.size > 0) {
         activeClients.forEach((client, user) => {
             const lastRun = syncCooldowns.get(user) || 0;

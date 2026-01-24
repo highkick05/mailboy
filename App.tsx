@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { mailService } from './services/mailService';
 import { Email, EmailFolder, CacheStats, MailConfig } from './types';
 import Layout from './components/Layout';
@@ -29,6 +29,9 @@ const App: React.FC = () => {
 
   const [emails, setEmails] = useState<Email[]>([]);
   const [currentFolder, setCurrentFolder] = useState<EmailFolder>('Inbox');
+  // Smart Tab State
+  const [activeCategory, setActiveCategory] = useState<string>('primary');
+  
   const [selectedEmail, setSelectedEmail] = useState<Email | null>(null);
   const [lastStats, setLastStats] = useState<CacheStats | null>(null);
   const [isComposeOpen, setIsComposeOpen] = useState(false);
@@ -39,10 +42,17 @@ const App: React.FC = () => {
   
   const [syncError, setSyncError] = useState<boolean>(false);
 
+  const [replyData, setReplyData] = useState<{ to: string; subject: string; body: string } | null>(null);
+  const updateTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Refresh List Logic
   const refreshList = useCallback(async () => {
     if (!mailService.isConfigured() || syncError) return;
     try {
-      const newData = await mailService.getAllEmails(currentFolder);
+      // Only filter by category if we are in the Inbox
+      const categoryParam = currentFolder === 'Inbox' ? activeCategory : undefined;
+      const newData = await mailService.getAllEmails(currentFolder, categoryParam);
+      
       setEmails(prevEmails => {
         if (prevEmails.length === 0) return newData;
         return newData.map(incoming => {
@@ -56,7 +66,7 @@ const App: React.FC = () => {
     } catch (e) {
       console.error("Refresh list failed", e);
     }
-  }, [currentFolder, syncError]);
+  }, [currentFolder, activeCategory, syncError]);
 
   const checkHealth = useCallback(async () => {
     const isUp = await mailService.checkBridgeHealth();
@@ -108,23 +118,19 @@ const App: React.FC = () => {
           refreshList();
         }
       }
-    }, 2000); // 🛑 CHANGED: Poll faster (2s) for better UI feedback
+    }, 2000); 
     return () => clearInterval(interval);
   }, [mailConfig, bridgeOnline, refreshList]);
 
-const handleSelectEmail = async (id: string) => {
+  const handleSelectEmail = async (id: string) => {
     try {
       const { data, stats } = await mailService.getEmailById(id);
       setLastStats(stats);
       if (data) {
         setSelectedEmail(data);
-        
-        // 🛑 NEW: Mark as Read locally and on server
         if (!data.read && mailConfig) {
-             // 1. Update Local State immediately for UI responsiveness
              setEmails(prev => prev.map(e => e.id === id ? { ...e, read: true } : e));
-             // 2. Fire and forget server update
-             mailService.markAsRead(id, mailConfig.user);
+             mailService.markAsRead(id, true);
         } else {
              setEmails(prev => prev.map(e => e.id === data.id ? data : e));
         }
@@ -190,13 +196,60 @@ const handleSelectEmail = async (id: string) => {
       setIsSettingsOpen(true);
       return;
     }
-    // 🛑 NEW: Manually set loading state for instant feedback
     setSyncProgress({ status: 'SYNCING', percent: 0 });
     try {
       await mailService.fetchRemoteMail();
     } catch (e: any) {
       if (e.message === 'AUTH_REQUIRED') setIsSettingsOpen(true);
     }
+  };
+
+  const handleSendEmail = async (payload: { to: string; subject: string; body: string }) => {
+    try {
+      await mailService.relaySmtp(payload);
+      if (currentFolder === 'Sent') {
+          setTimeout(() => refreshList(), 1000);
+      }
+    } catch (e) {
+      console.error("Failed to send", e);
+      throw e;
+    }
+  };
+
+  const handleBatchRead = async (ids: string[], read: boolean) => {
+    setEmails(prev => prev.map(email => 
+        ids.includes(email.id) ? { ...email, read } : email
+    ));
+
+    if (updateTimeoutRef.current) {
+        clearTimeout(updateTimeoutRef.current);
+    }
+
+    updateTimeoutRef.current = setTimeout(async () => {
+        try {
+            await mailService.batchMarkRead(ids, read);
+        } catch (e) {
+            console.error("Batch update failed", e);
+            refreshList(); 
+        }
+    }, 500);
+  };
+
+  const handleReply = (email: Email) => {
+      const originalDate = new Date(email.timestamp).toLocaleString();
+      const quoteHeader = `<br><br><br>On ${originalDate}, ${email.senderName || email.from} wrote:<br><blockquote style="border-left: 2px solid #ccc; padding-left: 10px; color: #555;">${email.body}</blockquote>`;
+      
+      setReplyData({
+          to: email.from,
+          subject: email.subject.startsWith('Re:') ? email.subject : `Re: ${email.subject}`,
+          body: quoteHeader
+      });
+      setIsComposeOpen(true);
+  };
+
+  const closeCompose = () => {
+      setIsComposeOpen(false);
+      setReplyData(null);
   };
 
   return (
@@ -223,7 +276,6 @@ const handleSelectEmail = async (id: string) => {
         onOpenSettings={() => setIsSettingsOpen(true)}
         onSync={handleSync}
         isConfigured={!!mailConfig && bridgeOnline === true}
-        // 🛑 UPDATED: Animation logic to include SYNCING status
         syncPercent={
             syncProgress?.status === 'HYDRATING' ? syncProgress.percent : 
             (syncProgress?.status === 'BURST' || syncProgress?.status === 'SYNCING' ? 100 : undefined)
@@ -273,6 +325,10 @@ const handleSelectEmail = async (id: string) => {
                         onSelect={handleSelectEmail} 
                         isLoading={isLoading} 
                         onRefresh={refreshList} 
+                        onBatchRead={handleBatchRead}
+                        onCategoryChange={(cat) => setActiveCategory(cat)}
+                        // 🛑 FIXED: Passing currentFolder so tabs know when to show
+                        currentFolder={currentFolder} 
                     />
                   </>
                 )}
@@ -283,8 +339,14 @@ const handleSelectEmail = async (id: string) => {
 
           {selectedEmail && (
             <div className="h-full w-full absolute inset-0 z-20 bg-slate-50 dark:bg-slate-950">
-               <div className="h-full w-full overflow-y-auto px-4 py-8 sm:px-6 custom-scrollbar">
-                 <EmailDetail email={selectedEmail} onClose={handleCloseEmail} />
+               <div className="h-full w-full flex flex-col px-4 py-4 sm:px-6 overflow-hidden">
+                 <div className="max-w-7xl w-full mx-auto flex-1 min-h-0 flex flex-col">
+                    <EmailDetail 
+                        email={selectedEmail} 
+                        onClose={handleCloseEmail} 
+                        onReply={handleReply}
+                    />
+                 </div>
                </div>
             </div>
           )}
@@ -295,7 +357,15 @@ const handleSelectEmail = async (id: string) => {
       
       <ComposeFAB onClick={() => setIsComposeOpen(true)} />
 
-      {isComposeOpen && <Compose onClose={() => setIsComposeOpen(false)} onSend={() => {}} userEmail={mailConfig?.user || ''} />}
+      {isComposeOpen && (
+        <Compose 
+          onClose={closeCompose} 
+          onSend={handleSendEmail} 
+          userEmail={mailConfig?.user || ''} 
+          initialData={replyData || undefined}
+        />
+      )}
+      
       {isSettingsOpen && <Settings onClose={() => setIsSettingsOpen(false)} onSave={handleSaveConfig} onReset={handleResetSystem} currentConfig={mailConfig} />}
     </div>
   );
