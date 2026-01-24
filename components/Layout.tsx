@@ -5,7 +5,7 @@ interface LayoutProps {
   children: React.ReactNode;
   currentFolder: EmailFolder;
   onFolderChange: (folder: EmailFolder) => void;
-  onCompose: () => void;
+  // 🛑 REMOVED: onCompose prop
   onOpenSettings: () => void;
   onSync: () => void;
   isConfigured: boolean;
@@ -16,7 +16,7 @@ interface LayoutProps {
 
 const folders: EmailFolder[] = ['Inbox', 'Sent', 'Drafts', 'Archive', 'Trash', 'Spam'];
 
-const Layout = forwardRef<HTMLDivElement, LayoutProps>(({ children, currentFolder, onFolderChange, onCompose, onOpenSettings, onSync, isConfigured, syncPercent, darkMode, toggleTheme }, ref) => {
+const Layout = forwardRef<HTMLDivElement, LayoutProps>(({ children, currentFolder, onFolderChange, onOpenSettings, onSync, isConfigured, syncPercent, darkMode, toggleTheme }, ref) => {
   return (
     <div className="flex flex-col h-screen bg-slate-50 dark:bg-slate-950 transition-colors duration-300 overflow-hidden">
       <header className="sticky top-0 z-50 w-full bg-white/90 dark:bg-slate-950/80 backdrop-blur-xl border-b border-slate-200 dark:border-slate-800 shadow-sm dark:shadow-none shrink-0">
@@ -70,14 +70,7 @@ const Layout = forwardRef<HTMLDivElement, LayoutProps>(({ children, currentFolde
 
             <div className="h-6 w-[1px] bg-slate-200 dark:bg-slate-800 mx-1 hidden sm:block"></div>
 
-            <button 
-              onClick={onCompose} 
-              disabled={!isConfigured}
-              className="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-xl text-sm font-bold shadow-lg shadow-blue-600/20 transition-all flex items-center gap-2 active:scale-95 disabled:opacity-50"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4" /></svg>
-              <span className="hidden sm:inline">Compose</span>
-            </button>
+            {/* 🛑 REMOVED: Compose Button was here */}
 
             <button 
               onClick={onOpenSettings} 

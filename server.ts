@@ -10,9 +10,11 @@ import { fileURLToPath } from 'url';
 import { ImapFlow } from 'imapflow';
 
 // Imports
-import { redis, connectDB, EmailModel } from './db';
+// 🛑 FIX: Import UserConfigModel
+import { redis, connectDB, EmailModel, UserConfigModel } from './db';
 import { resolveBrandLogo, resolveBrandName, TRANSPARENT_PIXEL } from './logo-engine';
-import { startWorkerSwarm, runFullSync, runQuickSync, getQueue, activeClients, syncLocks, syncCooldowns, userWorkers, workerState, systemStats, getFolderMap, preWarmCache } from './workers';
+// 🛑 FIX: Import spawnBackgroundClient
+import { startWorkerSwarm, runFullSync, runQuickSync, getQueue, activeClients, syncLocks, syncCooldowns, userWorkers, workerState, systemStats, getFolderMap, preWarmCache, spawnBackgroundClient } from './workers';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,7 +24,15 @@ const CACHE_DIR = path.join(process.cwd(), 'img_cache');
 const REDIS_TTL = 86400; 
 
 // Init
-connectDB();
+connectDB().then(async () => {
+    // 🛑 NEW: Boot Loader - Restore sessions for users with setupComplete: true
+    console.log("🔍 Scanning for Active Users...");
+    const activeUsers = await UserConfigModel.find({ setupComplete: true });
+    activeUsers.forEach(cfg => {
+        spawnBackgroundClient(cfg);
+    });
+});
+
 (async () => { try { await fs.mkdir(CACHE_DIR, { recursive: true }); } catch (e) {} })();
 
 app.use(cors() as any);
@@ -34,13 +44,27 @@ app.use(express.json() as any);
 
 app.get('/api/v1/health', (req, res) => { res.json({ status: 'UP', timestamp: Date.now() }); });
 
-// 🛑 RESTORED: Config Persistence Endpoint
+// 🛑 MODIFIED: Save Config to MongoDB (Persistent)
 app.post('/api/v1/config/save', async (req, res) => {
-  await redis.setex(`config:${req.body.user}`, REDIS_TTL, JSON.stringify(req.body));
-  res.json({ status: 'PERSISTED' });
+  try {
+      // 1. Save to Redis (Fast access)
+      await redis.setex(`config:${req.body.user}`, REDIS_TTL, JSON.stringify(req.body));
+      
+      // 2. Save to MongoDB (Persistence) - Upsert
+      await UserConfigModel.findOneAndUpdate(
+          { user: req.body.user },
+          { ...req.body, setupComplete: false }, // Reset setup flag on new config
+          { upsert: true, new: true }
+      );
+      res.json({ status: 'PERSISTED_DB' });
+  } catch (e) {
+      console.error("Config Save Failed", e);
+      res.status(500).json({ error: "DB_ERROR" });
+  }
 });
 
-// 🛑 RESTORED: Sync Status Endpoint
+// ... (Rest of file remains unchanged) ...
+
 app.get('/api/v1/sync/status', async (req, res) => {
   const prog = await redis.get(`sync_progress:${req.query.user}`);
   const queue = getQueue(req.query.user as string);
@@ -170,6 +194,8 @@ app.delete('/api/v1/debug/reset', async (req, res) => {
     activeClients.clear();
     await redis.flushall();
     await EmailModel.deleteMany({});
+    // 🛑 NEW: Clear Configs too
+    await UserConfigModel.deleteMany({});
     syncLocks.clear();
     syncCooldowns.clear();
     res.json({ status: 'SYSTEM_WIPED' });
@@ -185,9 +211,58 @@ app.get('/api/v1/debug/workers', (req, res) => {
     });
 });
 
-// 🛑 RESTORED: Monitor UI
 app.get('/monitor', (req, res) => {
     res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Mailboy Console</title><style>body{background:#0f172a;color:#e2e8f0;font-family:'Courier New',monospace;padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:20px}.card{background:#1e293b;padding:15px;border-radius:8px;border:1px solid #334155}.card.working{border-color:#22c55e;box-shadow:0 0 10px rgba(34,197,94,0.2)}.card.error{border-color:#ef4444}h1{font-size:1.5rem;margin-bottom:10px;color:#38bdf8}.stat-val{font-size:1.5rem;font-weight:bold}.stat-label{color:#94a3b8;font-size:0.8rem}</style></head><body><div style="display:flex;justify-content:space-between;align-items:center;"><h1>⚡ Mailboy Swarm</h1><div id="clock">--:--:--</div></div><div class="grid"><div class="card"><div class="stat-val" id="jobsCompleted">0</div><div class="stat-label">Jobs Done</div></div><div class="card"><div class="stat-val" id="queueSize">0</div><div class="stat-label">Queue</div></div><div class="card"><div class="stat-val" id="activeLocks">0</div><div class="stat-label">Active Syncs</div></div></div><h3>Workers</h3><div class="grid" id="workerGrid"></div><script>function update(){fetch('/api/v1/debug/workers').then(r=>r.json()).then(data=>{document.getElementById('jobsCompleted').innerText=data.system.jobsCompleted;document.getElementById('queueSize').innerText=data.queue?.pending||0;document.getElementById('activeLocks').innerText=data.locks.length;const grid=document.getElementById('workerGrid');grid.innerHTML=data.workers.map(w=>{const statusClass=w.status==='WORKING'?'working':(w.status==='ERROR'?'error':'');return \`<div class="card \${statusClass}"><div><strong>Worker \${w.id}</strong></div><div style="color:\${w.status==='WORKING'?'#4ade80':'#64748b'}">\${w.status}</div>\${w.status==='WORKING'?\`<div style="font-size:0.75rem;margin-top:5px;word-break:break-all;">\${w.jobId}</div><div style="font-size:0.75rem;color:#facc15;">\${(w.ageMs/1000).toFixed(1)}s</div><div style="font-size:0.75rem;color:#94a3b8;">📂 \${w.folder}</div>\`:''}</div>\`}).join('');document.getElementById('clock').innerText=new Date().toLocaleTimeString()})}setInterval(update,1000);update();</script></body></html>`);
+});
+
+// 🛑 NEW: Mark Email as Read/Unread
+app.post('/api/v1/mail/mark', async (req, res) => {
+  const { id, read, user } = req.body;
+  
+  // 1. Optimistic Update (DB & Cache)
+  await EmailModel.findOneAndUpdate({ id, user }, { read });
+  await redis.del(`mail_obj:${id}:${user}`); // Invalidate cache
+  // Also clear list cache so UI updates instantly
+  const emailMeta = await EmailModel.findOne({ id, user }, { folder: 1 });
+  if (emailMeta?.folder) {
+      await redis.del(`mail:${user}:list:${emailMeta.folder}`);
+  }
+
+  // 2. Propagate to IMAP Server (if active)
+  const client = activeClients.get(user);
+  if (client && client.usable && emailMeta) {
+    try {
+        const map = await getFolderMap(client, user);
+        const realPath = map[emailMeta.folder || 'Inbox'];
+        if (realPath) {
+            // We need to release any existing locks first? 
+            // ImapFlow handles locks well, but safe to do a quick action
+            // Using a separate async block so we don't block the HTTP response
+            (async () => {
+                const lock = await client.getMailboxLock(realPath);
+                try {
+                   // We need the UID, which is part of the ID string "uid-123-Inbox"
+                   // But let's fetch it safely from DB or parse the string
+                   const uidMatch = id.match(/uid-(\d+)-/);
+                   if (uidMatch) {
+                       const uid = uidMatch[1];
+                       if (read) {
+                           await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true });
+                       } else {
+                           await client.messageFlagsRemove(uid, ['\\Seen'], { uid: true });
+                       }
+                   }
+                } catch(e) {
+                    console.error("IMAP Flag Update Failed", e);
+                } finally {
+                    lock.release();
+                }
+            })();
+        }
+    } catch (e) {}
+  }
+
+  res.json({ status: 'UPDATED' });
 });
 
 const distPath = path.join(__dirname, 'dist');

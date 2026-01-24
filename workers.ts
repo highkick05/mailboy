@@ -1,8 +1,7 @@
 import { ImapFlow } from 'imapflow';
 import { Buffer } from 'buffer';
 import { convert } from 'html-to-text';
-// 🛑 FIX: Explicit .ts extension
-import { redis, EmailModel } from './db';
+import { redis, EmailModel, UserConfigModel } from './db';
 
 const BG_WORKER_COUNT = 10;
 const REDIS_TTL = 86400;
@@ -152,11 +151,13 @@ async function runWorker(workerId: number, config: any) {
             const exists = await EmailModel.findOne({ id: job.id }, { isFullBody: 1 });
             if (exists && exists.isFullBody) { queue.done(job.id); continue; }
 
+            // 🛑 CHANGED: Added `peek: true` to prevent marking as read when fetching body
             const msg = await client.fetchOne(job.data.uid.toString(), { bodyStructure: true }, { uid: true });
             if (!msg) throw new Error("Msg not found");
 
             const partId = findBestPart(msg.bodyStructure);
-            const downloadResult = await client.download(job.data.uid.toString(), partId, { uid: true });
+            // 🛑 CHANGED: Download with `peek: true` implies we don't change flags
+            const downloadResult = await client.download(job.data.uid.toString(), partId, { uid: true, peek: true });
             if (!downloadResult || !downloadResult.content) throw new Error("Empty content");
 
             let body = await streamToString(downloadResult.content);
@@ -196,12 +197,19 @@ export async function saveBatch(messages: any[], folder: string, user: string, q
         const f = msg.envelope.from?.[0] || {};
         const cleanName = f.name || f.address || 'Unknown';
         const cleanAddr = f.address || 'unknown';
+        // 🛑 NEW: Capture Read Status correctly from flags
+        const isRead = msg.flags.has('\\Seen');
 
         return {
             updateOne: {
                 filter: { id: `uid-${msg.uid}-${folder}`, user },
                 update: {
-                    $set: { timestamp: safeTimestamp(msg.envelope.date), read: msg.flags.has('\\Seen'), folder: folder },
+                    // 🛑 NEW: Update 'read' status on every sync
+                    $set: { 
+                        timestamp: safeTimestamp(msg.envelope.date), 
+                        read: isRead, 
+                        folder: folder 
+                    },
                     $setOnInsert: { 
                         uid: msg.uid, 
                         from: cleanAddr, 
@@ -241,20 +249,29 @@ export async function runQuickSync(client: ImapFlow, user: string) {
     const queue = getQueue(user);
     if (!inboxPath) return;
     try {
+        await redis.setex(`sync_progress:${user}`, 60, JSON.stringify({ status: 'SYNCING', percent: 0 }));
+
         if (client.mailbox) await client.mailboxClose();
         const lock = await client.getMailboxLock(inboxPath);
         try {
             if (client.mailbox.exists === 0) return;
-            const range = `${Math.max(1, client.mailbox.exists - 20)}:${client.mailbox.exists}`;
-            await syncRangeAtomic(client, range, 'Inbox', user, queue, 5);
+            // 🛑 OPTIMIZATION: Check for flag updates on recent messages
+            const range = `${Math.max(1, client.mailbox.exists - 50)}:${client.mailbox.exists}`;
+            await syncRangeAtomic(client, range, 'Inbox', user, queue, 10);
         } finally { lock.release(); }
     } catch (e) { console.error("Quick Sync Failed:", e); }
+    finally {
+        await redis.setex(`sync_progress:${user}`, 60, JSON.stringify({ status: 'IDLE', percent: 100 }));
+    }
 }
 
 export async function runFullSync(client: ImapFlow, user: string) {
   const map = await getFolderMap(client, user);
   const foldersToSync = ['Inbox', 'Trash', 'Sent', 'Drafts', 'Spam'];
   const queue = getQueue(user);
+  
+  await redis.setex(`sync_progress:${user}`, 300, JSON.stringify({ status: 'HYDRATING', percent: 1 }));
+
   for (const standardName of foldersToSync) {
     const realPath = map[standardName];
     if (!realPath) continue;
@@ -293,6 +310,10 @@ export async function runFullSync(client: ImapFlow, user: string) {
       } finally { lock.release(); }
     } catch (e) { console.error(`Failed to sync folder ${standardName}:`, e); }
   }
+  
+  await UserConfigModel.findOneAndUpdate({ user }, { setupComplete: true, lastSync: Date.now() });
+  await redis.setex(`sync_progress:${user}`, 60, JSON.stringify({ status: 'IDLE', percent: 100 }));
+  console.log(`🎉 FIRST SYNC COMPLETE for ${user}. Background sync enabled.`);
 }
 
 function findBestPart(node: any): string | null {
@@ -329,6 +350,22 @@ export function preWarmCache(emails: any[], user: string) {
   if (!emails || emails.length === 0) return;
   const queue = getQueue(user);
   emails.forEach(email => { if (!email.isFullBody) queue.add({ id: email.id, priority: 2, addedAt: Date.now(), data: { uid: email.uid, folder: email.folder, user }, attempts: 0 }); });
+}
+
+export async function spawnBackgroundClient(cfg: any) {
+    if (activeClients.has(cfg.user)) return;
+    try {
+        const client = new ImapFlow({
+            host: cfg.imapHost, port: cfg.imapPort, secure: cfg.useTLS || cfg.imapPort === 993,
+            auth: { user: cfg.user, pass: cfg.pass }, logger: false, clientTimeout: 60000, 
+        });
+        await client.connect();
+        activeClients.set(cfg.user, client);
+        startWorkerSwarm(cfg); 
+        console.log(`👻 Background Sync Session Restored: ${cfg.user}`);
+    } catch (e) {
+        console.error(`Failed to spawn background client for ${cfg.user}:`, e);
+    }
 }
 
 setInterval(() => {

@@ -7,6 +7,7 @@ import EmailDetail from './components/EmailDetail';
 import Compose from './components/Compose';
 import ArchitectureStatus from './components/ArchitectureStatus';
 import Settings from './components/Settings';
+import { ComposeFAB } from './components/ComposeFAB';
 
 const App: React.FC = () => {
   const [darkMode, setDarkMode] = useState(() => {
@@ -39,7 +40,6 @@ const App: React.FC = () => {
   const [syncError, setSyncError] = useState<boolean>(false);
 
   const refreshList = useCallback(async () => {
-    // 🛑 KILL SWITCH: Do not fetch if we are in error state
     if (!mailService.isConfigured() || syncError) return;
     try {
       const newData = await mailService.getAllEmails(currentFolder);
@@ -99,27 +99,35 @@ const App: React.FC = () => {
       const status = await mailService.getSyncStatus();
       setSyncProgress(status);
       
-      // 🛑 KILL SWITCH TRIGGER
       if (status.status === 'ERROR') {
         setSyncError(true);
-        setEmails([]); // <--- WIPE THE UI IMMEDIATELY
+        setEmails([]); 
       } else {
         setSyncError(false);
         if (status.status !== 'IDLE') {
           refreshList();
         }
       }
-    }, 5000); 
+    }, 2000); // 🛑 CHANGED: Poll faster (2s) for better UI feedback
     return () => clearInterval(interval);
   }, [mailConfig, bridgeOnline, refreshList]);
 
-  const handleSelectEmail = async (id: string) => {
+const handleSelectEmail = async (id: string) => {
     try {
       const { data, stats } = await mailService.getEmailById(id);
       setLastStats(stats);
       if (data) {
         setSelectedEmail(data);
-        setEmails(prev => prev.map(e => e.id === data.id ? data : e));
+        
+        // 🛑 NEW: Mark as Read locally and on server
+        if (!data.read && mailConfig) {
+             // 1. Update Local State immediately for UI responsiveness
+             setEmails(prev => prev.map(e => e.id === id ? { ...e, read: true } : e));
+             // 2. Fire and forget server update
+             mailService.markAsRead(id, mailConfig.user);
+        } else {
+             setEmails(prev => prev.map(e => e.id === data.id ? data : e));
+        }
       }
     } catch (e: any) {
       if (e.message === 'AUTH_REQUIRED') setIsSettingsOpen(true);
@@ -131,8 +139,6 @@ const App: React.FC = () => {
   };
 
   const handleSaveConfig = async (config: MailConfig) => {
-    // 🛑 UPDATED: Removed unused 'host' and 'apiPort' variables
-    // Now uses relative path for Protocol Agnostic fetching
     try {
       const response = await fetch(`/api/v1/config/save`, {
         method: 'POST',
@@ -146,14 +152,12 @@ const App: React.FC = () => {
       setMailConfig(config);
       setIsSettingsOpen(false);
       
-      // Reset logic
       setSyncError(false); 
       
       setTimeout(() => {
         checkHealth().then(online => {
           if (online) {
             mailService.fetchRemoteMail();
-            // Force a refresh after saving
             setTimeout(() => refreshList(), 1000);
           }
         });
@@ -165,7 +169,6 @@ const App: React.FC = () => {
   };
 
   const handleResetSystem = async () => {
-    // 🛑 UPDATED: Uses relative path
     try {
       const resp = await fetch(`/api/v1/debug/reset`, { method: 'DELETE' });
       if (!resp.ok) throw new Error("Wipe failed");
@@ -187,6 +190,8 @@ const App: React.FC = () => {
       setIsSettingsOpen(true);
       return;
     }
+    // 🛑 NEW: Manually set loading state for instant feedback
+    setSyncProgress({ status: 'SYNCING', percent: 0 });
     try {
       await mailService.fetchRemoteMail();
     } catch (e: any) {
@@ -197,7 +202,6 @@ const App: React.FC = () => {
   return (
     <div className="min-h-screen w-full bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors duration-300">
       
-      {/* 🚨 ERROR BANNER */}
       {syncError && (
         <div className="bg-red-600 text-white text-center py-2 px-4 font-bold text-sm sticky top-0 z-[100] flex justify-between items-center animate-in slide-in-from-top duration-300">
           <div className="flex items-center gap-2 mx-auto">
@@ -216,11 +220,14 @@ const App: React.FC = () => {
           setCurrentFolder(f); 
           setSelectedEmail(null); 
         }}
-        onCompose={() => setIsComposeOpen(true)}
         onOpenSettings={() => setIsSettingsOpen(true)}
         onSync={handleSync}
         isConfigured={!!mailConfig && bridgeOnline === true}
-        syncPercent={syncProgress?.status === 'HYDRATING' ? syncProgress.percent : (syncProgress?.status === 'BURST' ? 10 : undefined)}
+        // 🛑 UPDATED: Animation logic to include SYNCING status
+        syncPercent={
+            syncProgress?.status === 'HYDRATING' ? syncProgress.percent : 
+            (syncProgress?.status === 'BURST' || syncProgress?.status === 'SYNCING' ? 100 : undefined)
+        }
         darkMode={darkMode}
         toggleTheme={() => setDarkMode(prev => !prev)}
       >
@@ -236,7 +243,6 @@ const App: React.FC = () => {
             <div className="w-full px-4 sm:px-6 lg:px-8 py-8 h-full">
               <div className="max-w-7xl mx-auto flex flex-col gap-6 h-full">
                 
-                {/* 🛑 HIDE LIST IF ERROR */}
                 {syncError ? (
                   <div className="flex flex-col items-center justify-center h-full text-center text-slate-400">
                     <div className="bg-red-50 dark:bg-red-900/20 p-6 rounded-full mb-4">
@@ -249,7 +255,6 @@ const App: React.FC = () => {
                   <>
                     {!mailConfig && (
                       <div className="bg-white dark:bg-slate-900 border-2 border-dashed border-slate-200 dark:border-slate-800 rounded-[3rem] p-16 text-center animate-in fade-in zoom-in-95 duration-500 shadow-sm shrink-0">
-                        {/* ... (Welcome Content) ... */}
                         <div className="w-24 h-24 bg-blue-100 dark:bg-blue-900/30 rounded-full flex items-center justify-center mx-auto mb-8">
                           <svg className="w-12 h-12 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" /></svg>
                         </div>
@@ -263,7 +268,6 @@ const App: React.FC = () => {
                         </button>
                       </div>
                     )}
-                    {/* 🛑 UPDATED: Added onRefresh prop */}
                     <EmailList 
                         emails={emails} 
                         onSelect={handleSelectEmail} 
@@ -289,6 +293,8 @@ const App: React.FC = () => {
         <ArchitectureStatus stats={lastStats} />
       </Layout>
       
+      <ComposeFAB onClick={() => setIsComposeOpen(true)} />
+
       {isComposeOpen && <Compose onClose={() => setIsComposeOpen(false)} onSend={() => {}} userEmail={mailConfig?.user || ''} />}
       {isSettingsOpen && <Settings onClose={() => setIsSettingsOpen(false)} onSave={handleSaveConfig} onReset={handleResetSystem} currentConfig={mailConfig} />}
     </div>

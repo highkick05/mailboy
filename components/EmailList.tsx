@@ -55,8 +55,8 @@ export const BrandAvatar = ({ emailAddr, displayName }: { emailAddr: string, dis
   if (domain && !hasError) {
     const logoUrl = `${mailService.API_BASE}/proxy/logo?domain=${domain}`;
     return (
-      // 🛑 REMOVED BORDER CLASSES HERE
-      <div className={`${containerClasses} flex items-center justify-center bg-white dark:bg-slate-800 shadow-sm overflow-hidden`}>
+      // 🛑 CHANGED: Removed 'shadow-sm' to remove the light border effect
+      <div className={`${containerClasses} flex items-center justify-center bg-white dark:bg-slate-800 overflow-hidden`}>
         <img 
           src={logoUrl} 
           alt={displayName} 
@@ -68,7 +68,8 @@ export const BrandAvatar = ({ emailAddr, displayName }: { emailAddr: string, dis
   }
   
   return (
-    <div className={`${containerClasses} flex items-center justify-center text-2xl font-bold text-white shadow-sm bg-gradient-to-br from-blue-500 to-indigo-600`}>
+    // 🛑 CHANGED: Removed 'shadow-sm'
+    <div className={`${containerClasses} flex items-center justify-center text-2xl font-bold text-white bg-gradient-to-br from-blue-500 to-indigo-600`}>
       {initials}
     </div>
   );

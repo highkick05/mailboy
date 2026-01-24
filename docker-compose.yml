@@ -4,10 +4,11 @@ services:
     container_name: mailboy_app
     build: .
     restart: unless-stopped
+    # 🛑 MUST USE HOST MODE IN YOUR ENVIRONMENT
     network_mode: "host"
     environment:
+      # 🛑 HOST MODE REQUIRES 127.0.0.1 (Service names won't work)
       - MONGODB_URI=mongodb://127.0.0.1:27017/mailboy
-      # 🛑 UPDATE: Pointing to the new safe port
       - REDIS_URL=redis://127.0.0.1:6380
       - NODE_ENV=production
       - LOGO_DEV_KEY=${LOGO_DEV_KEY}
@@ -31,7 +32,6 @@ services:
     container_name: mailboy_redis
     restart: unless-stopped
     network_mode: "host"
-    # 🛑 COMMAND: Force Redis to listen on 6380
     command: redis-server --port 6380
     volumes:
       - redis_data:/data

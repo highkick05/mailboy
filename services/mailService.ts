@@ -97,6 +97,19 @@ class HybridMailService {
     } catch { return []; }
   }
 
+  // 🛑 NEW: Mark email as Read
+  async markAsRead(id: string, user: string): Promise<void> {
+    try {
+      await fetch(`${this.API_BASE}/mail/mark`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, user, read: true })
+      });
+    } catch (e) {
+      console.error("Failed to mark as read", e);
+    }
+  }
+
   async relaySmtp(email: Omit<Email, 'id' | 'timestamp' | 'read' | 'folder'>): Promise<{ email: Email; log: string }> {
     if (!this.config) throw new Error("AUTH_REQUIRED");
     const response = await fetch(`${this.API_BASE}/mail/send`, {
