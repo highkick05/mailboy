@@ -42,7 +42,8 @@ const App: React.FC = () => {
   
   const [syncError, setSyncError] = useState<boolean>(false);
 
-  const [replyData, setReplyData] = useState<{ to: string; subject: string; body: string } | null>(null);
+  // Added optional 'cc' to state
+  const [replyData, setReplyData] = useState<{ to: string; cc?: string; subject: string; body: string } | null>(null);
   const updateTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // Refresh List Logic
@@ -122,6 +123,7 @@ const App: React.FC = () => {
     return () => clearInterval(interval);
   }, [mailConfig, bridgeOnline, refreshList]);
 
+  // 🛑 UPDATED: Handle Selection with Feedback
   const handleSelectEmail = async (id: string) => {
     try {
       const { data, stats } = await mailService.getEmailById(id);
@@ -134,9 +136,17 @@ const App: React.FC = () => {
         } else {
              setEmails(prev => prev.map(e => e.id === data.id ? data : e));
         }
+      } else {
+          // 🛑 NEW: Feedback if fetch returns null (worker syncing body)
+          alert("This email is still syncing its full content. Please wait a moment and try again.");
       }
     } catch (e: any) {
-      if (e.message === 'AUTH_REQUIRED') setIsSettingsOpen(true);
+      if (e.message === 'AUTH_REQUIRED') {
+          setIsSettingsOpen(true);
+      } else {
+          // 🛑 NEW: Generic error alert
+          alert("Could not load email. Please check backend console.");
+      }
     }
   };
 
@@ -204,15 +214,49 @@ const App: React.FC = () => {
     }
   };
 
-  const handleSendEmail = async (payload: { to: string; subject: string; body: string }) => {
+  const handleSendEmail = async (data: { to: string; cc?: string; bcc?: string; subject: string; body: string; files?: File[] }) => {
     try {
-      await mailService.relaySmtp(payload);
-      if (currentFolder === 'Sent') {
-          setTimeout(() => refreshList(), 1000);
-      }
+        const formData = new FormData();
+        
+        const authPayload = {
+            user: mailConfig?.user,
+            pass: mailConfig?.pass,
+            smtpHost: mailConfig?.smtpHost,
+            smtpPort: mailConfig?.smtpPort
+        };
+        formData.append('auth', JSON.stringify(authPayload));
+        
+        const emailPayload = {
+            to: data.to,
+            cc: data.cc,
+            bcc: data.bcc,
+            subject: data.subject,
+            body: data.body
+        };
+        formData.append('payload', JSON.stringify(emailPayload));
+
+        if (data.files && data.files.length > 0) {
+            data.files.forEach(file => {
+                formData.append('files', file);
+            });
+        }
+
+        const response = await fetch('/api/v1/mail/send', {
+            method: 'POST',
+            body: formData 
+        });
+        
+        if (!response.ok) {
+            const err = await response.json();
+            throw new Error(err.error || "Send failed");
+        }
+        
+        if (currentFolder === 'Sent') {
+            setTimeout(() => refreshList(), 1000);
+        }
     } catch (e) {
-      console.error("Failed to send", e);
-      throw e;
+        console.error("Failed to send", e);
+        throw e;
     }
   };
 
@@ -241,8 +285,46 @@ const App: React.FC = () => {
       
       setReplyData({
           to: email.from,
-          subject: email.subject.startsWith('Re:') ? email.subject : `Re: ${email.subject}`,
+          subject: email.subject.toLowerCase().startsWith('re:') ? email.subject : `Re: ${email.subject}`,
           body: quoteHeader
+      });
+      setIsComposeOpen(true);
+  };
+
+  const handleReplyAll = (email: Email) => {
+      const originalDate = new Date(email.timestamp).toLocaleString();
+      const quoteHeader = `<br><br><br>On ${originalDate}, ${email.senderName || email.from} wrote:<br><blockquote style="border-left: 2px solid #ccc; padding-left: 10px; color: #555;">${email.body}</blockquote>`;
+      
+      const to = email.from;
+      const cc = (email as any).to || ""; 
+
+      setReplyData({
+          to: to,
+          cc: cc !== mailConfig?.user ? cc : undefined,
+          subject: email.subject.toLowerCase().startsWith('re:') ? email.subject : `Re: ${email.subject}`,
+          body: quoteHeader
+      });
+      setIsComposeOpen(true);
+  };
+
+  const handleForward = (email: Email) => {
+      const originalDate = new Date(email.timestamp).toLocaleString();
+      const header = `
+        <br><br>
+        ---------- Forwarded message ---------<br>
+        From: <strong>${email.senderName || email.from}</strong> <${email.from}><br>
+        Date: ${originalDate}<br>
+        Subject: ${email.subject}<br>
+        To: ${(email as any).to || "Unknown"}<br>
+        <br>
+      `;
+      
+      const quoteBody = `${header}<blockquote style="border-left: 2px solid #ccc; padding-left: 10px; color: #555;">${email.body}</blockquote>`;
+
+      setReplyData({
+          to: "", // Empty for forward
+          subject: email.subject.toLowerCase().startsWith('fwd:') ? email.subject : `Fwd: ${email.subject}`,
+          body: quoteBody
       });
       setIsComposeOpen(true);
   };
@@ -327,7 +409,6 @@ const App: React.FC = () => {
                         onRefresh={refreshList} 
                         onBatchRead={handleBatchRead}
                         onCategoryChange={(cat) => setActiveCategory(cat)}
-                        // 🛑 FIXED: Passing currentFolder so tabs know when to show
                         currentFolder={currentFolder} 
                     />
                   </>
@@ -345,6 +426,8 @@ const App: React.FC = () => {
                         email={selectedEmail} 
                         onClose={handleCloseEmail} 
                         onReply={handleReply}
+                        onReplyAll={handleReplyAll}
+                        onForward={handleForward}
                     />
                  </div>
                </div>

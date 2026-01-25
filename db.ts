@@ -16,7 +16,16 @@ const connectDB = async () => {
   }
 };
 
-// 3. Email Schema (Updated with 'category')
+// 🛑 NEW: Attachment Schema (Metadata only - files live on disk)
+const AttachmentSchema = new mongoose.Schema({
+  filename: String,
+  path: String,      // Relative path on disk (e.g., "171542384-report.pdf")
+  size: Number,      // Size in bytes
+  mimeType: String,  // e.g., "application/pdf"
+  cid: String        // Content-ID for inline images
+});
+
+// 3. Email Schema (Updated with 'category' and 'attachments')
 const EmailSchema = new mongoose.Schema({
   id: { type: String, unique: true }, // Composite: uid-folder
   uid: { type: Number },
@@ -34,8 +43,11 @@ const EmailSchema = new mongoose.Schema({
   folder: { type: String, index: true },
   labels: { type: [String], default: [] },
   
-  // 🛑 NEW: Smart Tab Category ('primary', 'social', 'updates', 'promotions')
-  category: { type: String, default: 'primary', index: true } 
+  // Smart Tab Category ('primary', 'social', 'updates', 'promotions')
+  category: { type: String, default: 'primary', index: true },
+
+  // 🛑 NEW: Attachments Array
+  attachments: [AttachmentSchema] 
 });
 // Compound index for efficient list fetching
 EmailSchema.index({ user: 1, folder: 1, timestamp: -1 });
@@ -62,14 +74,14 @@ const LabelSchema = new mongoose.Schema({
   created: { type: Number, default: Date.now }
 });
 
-// 6. 🛑 NEW: Smart Rule Schema (For Keyword Learning)
+// 6. Smart Rule Schema (For Keyword Learning)
 const SmartRuleSchema = new mongoose.Schema({
     user: { type: String, required: true, index: true },
     category: { type: String, required: true }, // 'primary', 'social', 'updates', 'promotions'
     type: { type: String, default: 'from' },    // 'from' or 'subject'
-    value: { type: String, required: true }     // e.g. 'twitter.com', 'newsletter'
+    value: { type: String, required: true }      // e.g. 'twitter.com', 'newsletter'
 });
-// Compound index to prevent duplicates: A user cannot have the same keyword for the same category twice
+// Compound index to prevent duplicates
 SmartRuleSchema.index({ user: 1, category: 1, value: 1 }, { unique: true });
 
 const EmailModel = mongoose.model('Email', EmailSchema);

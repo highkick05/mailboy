@@ -1,12 +1,17 @@
 import { ImapFlow } from 'imapflow';
 import { Buffer } from 'buffer';
 import { convert } from 'html-to-text';
+// 🛑 NEW: File System imports for Attachments
+import fs from 'fs/promises';
+import path from 'path';
 import { redis, EmailModel, UserConfigModel, SmartRuleModel } from './db';
 
 const BG_WORKER_COUNT = 10;
 const REDIS_TTL = 86400;
+// 🛑 NEW: Attachments Directory
+const ATTACHMENT_DIR = path.join(process.cwd(), 'attachments');
 
-// 🛑 NEW: System State Flag (The Kill Switch)
+// System State Flag (The Kill Switch)
 let isSystemRunning = true;
 
 export const workerState = new Array(BG_WORKER_COUNT).fill(null).map((_, i) => ({
@@ -20,7 +25,33 @@ let connectionBackoffUntil = 0;
 export const userWorkers = new Map<string, boolean>();
 export const activeClients = new Map<string, ImapFlow>();
 
-// 🛑 NEW: Kill Swarm Function
+// Default Keywords for Heuristic Classification
+const DEFAULT_RULES = {
+    promotions: [
+        'unsubscribe', 'opt-out', 'view in browser', 'preferences', 'terms and conditions',
+        '% off', 'sale', 'discount', 'clearance', 'promo code', 'coupon', 'free shipping',
+        'shop now', 'limited time', 'last chance', 'exclusive offer',
+        'newsletter', 'marketing', 'no-reply', 'info@', 'hello@'
+    ],
+    social: [
+        'facebook', 'twitter', 'linkedin', 'instagram', 'pinterest', 'tiktok', 'youtube', 
+        'friend request', 'follower', 'connection'
+    ],
+    updates: [
+        // Finance & Billing
+        'receipt', 'billing', 'invoice', 'order', 'confirmation', 'statement', 'payment', 'refund', 'processed', 'transfer',
+        // Shipping & Delivery
+        'tracking', 'shipment', 'shipped', 'delivered', 'package', 'courier', 'dispatch', 'arriving',
+        // Account & Security
+        'security alert', 'password reset', 'verification', 'verify', 'login', 'sign in', 'account update', 'policy update', 'terms of service',
+        // Appointments & Events
+        'appointment', 'reminder', 'schedule', 'booking', 'reservation', 'ticket',
+        // Support
+        'support request', 'ticket received', 'case #'
+    ]
+};
+
+// Kill Swarm Function
 export const killSwarm = async () => {
     console.log("☠️ KILL SWITCH ENGAGED: Stopping all workers...");
     isSystemRunning = false; // Prevent new loops
@@ -45,7 +76,7 @@ export const killSwarm = async () => {
     
     console.log("✅ SWARM DESTROYED.");
     
-    // Allow restart after a brief pause (optional, or require manual restart)
+    // Allow restart after a brief pause
     setTimeout(() => { isSystemRunning = true; }, 1000);
 };
 
@@ -106,6 +137,22 @@ export async function getFolderMap(client: ImapFlow, user: string): Promise<Reco
     await redis.setex(`folder_map:${user}`, 60, JSON.stringify(map));
     return map;
   } catch (e) { return map; }
+}
+
+// 🛑 NEW: Helper to find attachment parts recursively
+function findAttachmentParts(node: any): any[] {
+    let attachments: any[] = [];
+    // Standard attachments or inline images with filenames
+    if (node.disposition === 'attachment' || (node.disposition === 'inline' && node.filename)) {
+        attachments.push(node);
+    }
+    // Recursively check children (multipart)
+    if (node.childNodes) {
+        for (const child of node.childNodes) {
+            attachments = attachments.concat(findAttachmentParts(child));
+        }
+    }
+    return attachments;
 }
 
 export async function startWorkerSwarm(config: any) {
@@ -189,6 +236,7 @@ async function runWorker(workerId: number, config: any) {
             const msg = await client.fetchOne(job.data.uid.toString(), { bodyStructure: true }, { uid: true });
             if (!msg) throw new Error("Msg not found");
 
+            // 🛑 1. Download Body
             const partId = findBestPart(msg.bodyStructure);
             const downloadResult = await client.download(job.data.uid.toString(), partId, { uid: true, peek: true });
             if (!downloadResult || !downloadResult.content) throw new Error("Empty content");
@@ -197,9 +245,44 @@ async function runWorker(workerId: number, config: any) {
             body = body.replace(/src=["'](https?:\/\/[^"']+)["']/gi, (match, url) => `src="/api/v1/proxy/image?url=${encodeURIComponent(url)}"`);
             const preview = generateSmartSnippet(body);
 
+            // 🛑 2. Download Attachments
+            const attachmentParts = findAttachmentParts(msg.bodyStructure);
+            const savedAttachments: any[] = [];
+
+            for (const part of attachmentParts) {
+                if (!part.part) continue;
+                try {
+                    // Create a unique, safe filename
+                    const safeFilename = (part.filename || 'unnamed').replace(/[^a-z0-9.]/gi, '_');
+                    const uniqueFilename = `${Date.now()}-${Math.round(Math.random()*1000)}-${safeFilename}`;
+                    const filePath = path.join(ATTACHMENT_DIR, uniqueFilename);
+                    
+                    // Stream download to disk
+                    const attStream = await client.download(job.data.uid.toString(), part.part, { uid: true, peek: true });
+                    if (attStream && attStream.content) {
+                        await fs.writeFile(filePath, attStream.content);
+                        savedAttachments.push({
+                            filename: part.filename || 'unnamed',
+                            path: uniqueFilename, // Save relative path
+                            size: part.size || 0,
+                            mimeType: part.type,
+                            cid: part.id // Support for inline images
+                        });
+                    }
+                } catch (err) {
+                    console.error("Failed to download attachment", err);
+                }
+            }
+
             const updated = await EmailModel.findOneAndUpdate(
                 { id: job.id, user: config.user },
-                { body, preview, isFullBody: true },
+                { 
+                    body, 
+                    preview, 
+                    isFullBody: true,
+                    // 🛑 Save attachment metadata to DB
+                    attachments: savedAttachments
+                },
                 { new: true, upsert: true }
             );
 
@@ -225,7 +308,7 @@ function safeTimestamp(date: any): number {
     return isNaN(ts) ? Date.now() : ts;
 }
 
-// 🛑 NEW: Helper to fetch user Smart Rules
+// Helper to fetch user Smart Rules
 async function getUserRules(user: string) {
     const cacheKey = `smart_rules:${user}`;
     const cached = await redis.get(cacheKey);
@@ -236,22 +319,22 @@ async function getUserRules(user: string) {
     return rules;
 }
 
-// 🛑 NEW: Classifier Logic
+// Classifier Logic with Default Keywords
 async function classifyEmail(msg: any, user: string): Promise<string> {
     const rules = await getUserRules(user);
     const from = (msg.envelope.from?.[0]?.address || "").toLowerCase();
     const subject = (msg.envelope.subject || "").toLowerCase();
-
-    // 1. Check User Rules (High Priority)
+    
+    // 1. Check User-Defined Rules (Highest Priority)
     for (const rule of rules) {
         if (rule.type === 'from' && from.includes(rule.value.toLowerCase())) return rule.category;
         if (rule.type === 'subject' && subject.includes(rule.value.toLowerCase())) return rule.category;
     }
 
-    // 2. Hardcoded Fallbacks (Base Logic)
-    if (from.includes('facebook') || from.includes('twitter') || from.includes('linkedin') || from.includes('instagram')) return 'social';
-    if (from.includes('marketing') || from.includes('newsletter') || from.includes('no-reply') || from.includes('offer')) return 'promotions';
-    if (from.includes('receipt') || from.includes('billing') || from.includes('invoice') || from.includes('order')) return 'updates';
+    // 2. Check Default Keywords (Heuristics)
+    if (DEFAULT_RULES.promotions.some(kw => from.includes(kw) || subject.includes(kw))) return 'promotions';
+    if (DEFAULT_RULES.social.some(kw => from.includes(kw) || subject.includes(kw))) return 'social';
+    if (DEFAULT_RULES.updates.some(kw => from.includes(kw) || subject.includes(kw))) return 'updates';
 
     return 'primary';
 }
@@ -259,7 +342,7 @@ async function classifyEmail(msg: any, user: string): Promise<string> {
 export async function saveBatch(messages: any[], folder: string, user: string, queue: JobQueue) {
     if (!isSystemRunning) return; // 🛑 Check Lock
     
-    // 🛑 Pre-calculate categories for the batch
+    // Pre-calculate categories for the batch
     const classifiedData = await Promise.all(messages.map(async (msg) => {
         return {
             msg,
@@ -281,7 +364,7 @@ export async function saveBatch(messages: any[], folder: string, user: string, q
                         timestamp: safeTimestamp(msg.envelope.date), 
                         read: isRead, 
                         folder: folder,
-                        category: category // 🛑 Saving Category
+                        category: category // Saving Category
                     },
                     $setOnInsert: { 
                         uid: msg.uid, 

@@ -176,6 +176,25 @@ const EmailList: React.FC<EmailListProps> = ({ emails, onSelect, isLoading, onRe
       if (onRefresh) onRefresh();
   };
 
+  // 🛑 NEW: Mark as Spam Handler
+  const handleMarkAsSpam = async () => {
+      const count = selectedIds.size;
+      if (count === 0) return;
+      
+      // 1. Optimistic UI: Hide immediately
+      const idsToSpam = Array.from(selectedIds);
+      const newHidden = new Set(optimisticallyHidden);
+      idsToSpam.forEach(id => newHidden.add(id));
+      setOptimisticallyHidden(newHidden);
+      setSelectedIds(new Set()); // Clear selection
+
+      // 2. Perform Move in Background
+      await Promise.all(idsToSpam.map(id => mailService.moveEmail(id, 'Spam')));
+      
+      // 3. Refresh list
+      if (onRefresh) onRefresh();
+  };
+
   // 🛑 UPDATED: Batch Read/Unread Handler using prop
   const handleBatchReadStatus = (read: boolean) => {
       const ids = Array.from(selectedIds);
@@ -284,6 +303,17 @@ const EmailList: React.FC<EmailListProps> = ({ emails, onSelect, isLoading, onRe
                     <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                 </button>
 
+                {/* 🛑 NEW: Mark as Spam */}
+                <button 
+                    onClick={handleMarkAsSpam} 
+                    className="p-1.5 rounded-lg text-slate-500 hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors" 
+                    title="Mark as Spam"
+                >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                </button>
+
                 {/* Mark as Read */}
                 <button 
                     onClick={() => handleBatchReadStatus(true)}
@@ -367,6 +397,8 @@ const EmailList: React.FC<EmailListProps> = ({ emails, onSelect, isLoading, onRe
             const senderAddr = (email as any).senderAddr || email.from;
             const snippet = getSnippet(email);
             const isSelected = selectedIds.has(email.id);
+            // 🛑 NEW: Check for attachments
+            const hasAttachments = (email as any).attachments && (email as any).attachments.length > 0;
             
             return (
               <div
@@ -412,6 +444,12 @@ const EmailList: React.FC<EmailListProps> = ({ emails, onSelect, isLoading, onRe
                         {email.labels && email.labels.length > 0 && email.labels.map(labelId => (
                             <span key={labelId} className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 uppercase tracking-wider">{labelId}</span>
                         ))}
+                        
+                        {/* 🛑 NEW: Attachment Icon */}
+                        {hasAttachments && (
+                            <svg className="w-3.5 h-3.5 text-slate-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
+                        )}
+
                         <span className={`text-sm truncate ${!email.read ? 'font-bold text-slate-800 dark:text-slate-100' : 'font-medium text-slate-600 dark:text-slate-400'}`}>{email.subject}</span>
                     </div>
                     <span className="text-xs text-slate-400 dark:text-slate-500 truncate font-normal">{snippet}</span>

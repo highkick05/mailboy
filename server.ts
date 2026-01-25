@@ -9,9 +9,8 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { ImapFlow } from 'imapflow';
 import nodemailer from 'nodemailer';
+import multer from 'multer';
 
-// Imports
-// 🛑 UPDATED: Added SmartRuleModel
 import { redis, connectDB, EmailModel, UserConfigModel, LabelModel, SmartRuleModel } from './db';
 import { resolveBrandLogo, resolveBrandName, TRANSPARENT_PIXEL } from './logo-engine';
 import { startWorkerSwarm, runFullSync, runQuickSync, getQueue, activeClients, syncLocks, syncCooldowns, userWorkers, workerState, systemStats, getFolderMap, preWarmCache, spawnBackgroundClient, killSwarm } from './workers';
@@ -21,19 +20,53 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const CACHE_DIR = path.join(process.cwd(), 'img_cache');
+const ATTACHMENT_DIR = path.join(process.cwd(), 'attachments');
 const REDIS_TTL = 86400; 
+
+// Configure Multer for Disk Storage
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, ATTACHMENT_DIR);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const safeName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+    cb(null, uniqueSuffix + '-' + safeName);
+  }
+});
+const upload = multer({ storage: storage });
+
+// Default Keywords Logic
+const DEFAULT_PROMO_KEYWORDS = ['unsubscribe', 'opt-out', 'view in browser', 'preferences', 'terms and conditions', '% off', 'sale', 'discount', 'clearance', 'promo code', 'coupon', 'free shipping', 'price drop', 'shop now', 'limited time', 'last chance', "don't miss out", 'ending soon', 'exclusive offer', 'newsletter', 'marketing', 'no-reply', 'info@', 'hello@'];
+
+async function seedDefaultRules(user: string) {
+    const count = await SmartRuleModel.countDocuments({ user, category: 'promotions' });
+    if (count > 5) return; 
+    const ops = DEFAULT_PROMO_KEYWORDS.map(kw => ({
+        updateOne: {
+            filter: { user, category: 'promotions', value: kw.toLowerCase() },
+            update: { user, category: 'promotions', type: kw.includes('@') ? 'from' : 'content', value: kw.toLowerCase() },
+            upsert: true
+        }
+    }));
+    await SmartRuleModel.bulkWrite(ops);
+    await redis.del(`smart_rules:${user}`);
+}
 
 // Init
 connectDB().then(async () => {
-    // 🔍 Boot Loader - Restore sessions for users with setupComplete: true
     console.log("🔍 Scanning for Active Users...");
     const activeUsers = await UserConfigModel.find({ setupComplete: true });
-    activeUsers.forEach(cfg => {
+    for (const cfg of activeUsers) {
         spawnBackgroundClient(cfg);
-    });
+        await seedDefaultRules(cfg.user);
+    }
 });
 
-(async () => { try { await fs.mkdir(CACHE_DIR, { recursive: true }); } catch (e) {} })();
+(async () => { 
+    try { await fs.mkdir(CACHE_DIR, { recursive: true }); } catch (e) {} 
+    try { await fs.mkdir(ATTACHMENT_DIR, { recursive: true }); } catch (e) {} 
+})();
 
 app.use(cors() as any);
 app.use(express.json() as any);
@@ -44,18 +77,23 @@ app.use(express.json() as any);
 
 app.get('/api/v1/health', (req, res) => { res.json({ status: 'UP', timestamp: Date.now() }); });
 
-// Save Config to MongoDB (Persistent)
+app.get('/api/v1/attachments/:filename', (req, res) => {
+    const filePath = path.join(ATTACHMENT_DIR, req.params.filename);
+    if (!filePath.startsWith(ATTACHMENT_DIR)) return res.status(403).send('Access Denied');
+    res.download(filePath, (err) => {
+        if (err) res.status(404).send('File not found');
+    });
+});
+
 app.post('/api/v1/config/save', async (req, res) => {
   try {
-      // 1. Save to Redis (Fast access)
       await redis.setex(`config:${req.body.user}`, REDIS_TTL, JSON.stringify(req.body));
-      
-      // 2. Save to MongoDB (Persistence) - Upsert
       await UserConfigModel.findOneAndUpdate(
           { user: req.body.user },
-          { ...req.body, setupComplete: false }, // Reset setup flag on new config
+          { ...req.body, setupComplete: false }, 
           { upsert: true, new: true }
       );
+      await seedDefaultRules(req.body.user);
       res.json({ status: 'PERSISTED_DB' });
   } catch (e) {
       console.error("Config Save Failed", e);
@@ -96,12 +134,9 @@ app.get('/api/v1/proxy/brand-name', async (req, res) => {
 app.post('/api/v1/mail/sync', async (req, res) => {
   const { user } = req.body;
   if (syncLocks.get(user)) return res.json({ status: 'SYNC_IN_PROGRESS' });
-  
   syncLocks.set(user, true);
   await redis.setex(`sync_active:${user}`, 30, '1');
-  
   startWorkerSwarm(req.body);
-  
   (async () => {
     try {
         const getClient = async (cfg: any) => {
@@ -124,55 +159,93 @@ app.post('/api/v1/mail/sync', async (req, res) => {
 });
 
 app.get('/api/v1/mail/list', async (req, res) => {
-  const { user, folder, category } = req.query; // 🛑 Added category
+  const { user, folder, category } = req.query; 
   const target = (folder as string) || 'Inbox';
-  
-  // Distinguish between System Folders and Custom Labels
   const SYSTEM_FOLDERS = ['Inbox', 'Sent', 'Drafts', 'Trash', 'Spam', 'Archive'];
-  
-  // Build the query dynamically
   const query: any = { user };
-  
   if (SYSTEM_FOLDERS.includes(target)) {
       query.folder = target;
-      
-      // 🛑 SMART TABS: Only filter by category if we are in Inbox and category is set
       if (target === 'Inbox' && category && category !== 'all') {
           query.category = category;
       }
   } else {
       query.labels = target; 
   }
-
-  const listKey = `mail:${user}:list:${target}:${category || 'all'}`; // Updated cache key
+  const listKey = `mail:${user}:list:${target}:${category || 'all'}`; 
   const isLiveMode = await redis.get(`sync_active:${user}`);
-  
   let listData = null;
   if (!isLiveMode) {
       const cached = await redis.get(listKey);
       if (cached) listData = JSON.parse(cached);
   }
-  
   if (!listData) {
     listData = await EmailModel.find(query).sort({ timestamp: -1 }).limit(100).lean();
     if (listData.length > 0 && !isLiveMode) await redis.setex(listKey, REDIS_TTL, JSON.stringify(listData));
   }
-  
   if (listData && listData.length > 0) preWarmCache(listData, user as string);
-  
   res.json(listData);
 });
 
+// 🛑 UPDATED: Email Detail Fetch with Polling Logic
 app.get('/api/v1/mail/:id', async (req, res) => {
   const { id } = req.params;
   const { user } = req.query;
   const cacheKey = `mail_obj:${id}:${user}`;
+
+  // 1. Try Redis
   const l1 = await redis.get(cacheKey);
-  if (l1) { const data = JSON.parse(l1); if (data.isFullBody) return res.json({ email: data, source: 'Redis' }); }
+  if (l1) { 
+      const data = JSON.parse(l1); 
+      if (data.isFullBody) return res.json({ email: data, source: 'Redis' }); 
+  }
+
+  // 2. Try DB
   const l2 = await EmailModel.findOne({ id, user });
-  if (l2 && l2.isFullBody) { await redis.setex(cacheKey, REDIS_TTL, JSON.stringify(l2)); return res.json({ email: l2, source: 'MongoDB' }); }
-  const queue = getQueue(user as string);
-  if (l2) queue.add({ id: l2.id, priority: 1, addedAt: 0, data: { uid: l2.uid!, folder: l2.folder || 'Inbox', user: user as string }, attempts: 0 });
+  if (l2 && l2.isFullBody) { 
+      await redis.setex(cacheKey, REDIS_TTL, JSON.stringify(l2)); 
+      return res.json({ email: l2, source: 'MongoDB' }); 
+  }
+
+  // 3. Not found or partial body? Queue it and WAIT (Polling).
+  if (l2) {
+      const queue = getQueue(user as string);
+      // Priority 1 jumps to the front of the queue
+      queue.add({ 
+          id: l2.id, 
+          priority: 1, 
+          addedAt: Date.now(), 
+          data: { uid: l2.uid!, folder: l2.folder || 'Inbox', user: user as string }, 
+          attempts: 0 
+      });
+
+      // 🛑 POLLING LOOP: Wait for worker to finish (Max 10 seconds)
+      const MAX_ATTEMPTS = 20; // 20 * 500ms = 10s
+      const INTERVAL = 500; // ms
+
+      for (let i = 0; i < MAX_ATTEMPTS; i++) {
+          await new Promise(resolve => setTimeout(resolve, INTERVAL));
+          
+          // Check Redis again (Workers write to Redis upon completion)
+          const check = await redis.get(cacheKey);
+          if (check) {
+              const freshData = JSON.parse(check);
+              if (freshData.isFullBody) {
+                  return res.json({ email: freshData, source: 'Worker-Live' });
+              }
+          }
+          // Optional: Check DB if Redis failed (double safety)
+          if (i % 4 === 0) { // Check DB every 2 seconds
+             const dbCheck = await EmailModel.findOne({ id, user }, { isFullBody: 1 });
+             if (dbCheck && dbCheck.isFullBody) {
+                 const fullDoc = await EmailModel.findOne({ id, user });
+                 await redis.setex(cacheKey, REDIS_TTL, JSON.stringify(fullDoc));
+                 return res.json({ email: fullDoc, source: 'Worker-DB-Live' });
+             }
+          }
+      }
+  }
+
+  // If we time out after 10s, return 408
   res.status(408).json({ error: 'Fetch timed out - Worker busy' });
 });
 
@@ -207,7 +280,6 @@ app.get('/api/v1/proxy/image', async (req, res) => {
   }
 });
 
-// Reset now kills the swarm first
 app.delete('/api/v1/debug/reset', async (req, res) => {
   try {
     await killSwarm();
@@ -215,8 +287,7 @@ app.delete('/api/v1/debug/reset', async (req, res) => {
     await EmailModel.deleteMany({});
     await UserConfigModel.deleteMany({});
     await LabelModel.deleteMany({});
-    await SmartRuleModel.deleteMany({}); // 🛑 Clear Smart Rules too
-
+    await SmartRuleModel.deleteMany({}); 
     console.log("✨ System Reset Cleanly");
     res.json({ status: 'SYSTEM_WIPED' });
   } catch (e) { 
@@ -238,22 +309,38 @@ app.get('/monitor', (req, res) => {
     res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Mailboy Console</title><style>body{background:#0f172a;color:#e2e8f0;font-family:'Courier New',monospace;padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:20px}.card{background:#1e293b;padding:15px;border-radius:8px;border:1px solid #334155}.card.working{border-color:#22c55e;box-shadow:0 0 10px rgba(34,197,94,0.2)}.card.error{border-color:#ef4444}h1{font-size:1.5rem;margin-bottom:10px;color:#38bdf8}.stat-val{font-size:1.5rem;font-weight:bold}.stat-label{color:#94a3b8;font-size:0.8rem}</style></head><body><div style="display:flex;justify-content:space-between;align-items:center;"><h1>⚡ Mailboy Swarm</h1><div id="clock">--:--:--</div></div><div class="grid"><div class="card"><div class="stat-val" id="jobsCompleted">0</div><div class="stat-label">Jobs Done</div></div><div class="card"><div class="stat-val" id="queueSize">0</div><div class="stat-label">Queue</div></div><div class="card"><div class="stat-val" id="activeLocks">0</div><div class="stat-label">Active Syncs</div></div></div><h3>Workers</h3><div class="grid" id="workerGrid"></div><script>function update(){fetch('/api/v1/debug/workers').then(r=>r.json()).then(data=>{document.getElementById('jobsCompleted').innerText=data.system.jobsCompleted;document.getElementById('queueSize').innerText=data.queue?.pending||0;document.getElementById('activeLocks').innerText=data.locks.length;const grid=document.getElementById('workerGrid');grid.innerHTML=data.workers.map(w=>{const statusClass=w.status==='WORKING'?'working':(w.status==='ERROR'?'error':'');return \`<div class="card \${statusClass}"><div><strong>Worker \${w.id}</strong></div><div style="color:\${w.status==='WORKING'?'#4ade80':'#64748b'}">\${w.status}</div>\${w.status==='WORKING'?\`<div style="font-size:0.75rem;margin-top:5px;word-break:break-all;">\${w.jobId}</div><div style="font-size:0.75rem;color:#facc15;">\${(w.ageMs/1000).toFixed(1)}s</div><div style="font-size:0.75rem;color:#94a3b8;">📂 \${w.folder}</div>\`:''}</div>\`}).join('');document.getElementById('clock').innerText=new Date().toLocaleTimeString()})}setInterval(update,1000);update();</script></body></html>`);
 });
 
-// SMTP Relay Endpoint
-app.post('/api/v1/mail/send', async (req, res) => {
-  const { auth, payload } = req.body;
-  if (!auth || !payload) return res.status(400).json({ error: "MISSING_DATA" });
+// SMTP Relay with Attachments
+app.post('/api/v1/mail/send', upload.array('files', 10), async (req, res) => {
+  const { auth: authStr, payload: payloadStr } = req.body;
+  if (!authStr || !payloadStr) return res.status(400).json({ error: "MISSING_DATA" });
+  
   try {
+      const auth = JSON.parse(authStr);
+      const payload = JSON.parse(payloadStr);
+      
+      const attachments = (req.files as Express.Multer.File[] || []).map(file => ({
+          filename: file.originalname,
+          path: file.path
+      }));
+
       const isImplicitSSL = auth.smtpPort === 465;
       const transporter = nodemailer.createTransport({
           host: auth.smtpHost, port: auth.smtpPort, secure: isImplicitSSL, 
           auth: { user: auth.user, pass: auth.pass },
           tls: { rejectUnauthorized: false, ciphers: 'SSLv3' }
       });
+      
       const info = await transporter.sendMail({
           from: `"${auth.user}" <${auth.user}>`, 
-          to: payload.to, subject: payload.subject,
-          text: payload.body.replace(/<[^>]*>?/gm, ''), html: payload.body
+          to: payload.to, 
+          cc: payload.cc,
+          bcc: payload.bcc,
+          subject: payload.subject,
+          text: payload.body.replace(/<[^>]*>?/gm, ''), 
+          html: payload.body,
+          attachments: attachments
       });
+      
       console.log(`📤 Email sent: ${info.messageId}`);
       res.json({ status: 'SENT', messageId: info.messageId });
   } catch (error: any) {
@@ -262,7 +349,6 @@ app.post('/api/v1/mail/send', async (req, res) => {
   }
 });
 
-// Mark Email as Read/Unread
 app.post('/api/v1/mail/mark', async (req, res) => {
   const { id, read, user } = req.body;
   await EmailModel.findOneAndUpdate({ id, user }, { read });
@@ -294,11 +380,8 @@ app.post('/api/v1/mail/mark', async (req, res) => {
   res.json({ status: 'UPDATED' });
 });
 
-// 🛑 UPDATED: Move Email + Smart Learning + BULK UPDATE
 app.post('/api/v1/mail/move', async (req, res) => {
   const { emailId, targetFolder, user } = req.body;
-  
-  // 1. Check if this is a Smart Category Move
   const SMART_TABS = ['primary', 'social', 'updates', 'promotions'];
   const isCategoryMove = SMART_TABS.includes(targetFolder.toLowerCase());
 
@@ -306,34 +389,16 @@ app.post('/api/v1/mail/move', async (req, res) => {
     const email = await EmailModel.findOne({ id: emailId, user });
     if (!email) return res.status(404).json({ error: "Email not found" });
 
-    // A: HANDLE SMART TAB MOVE (Learn + Classify + Bulk Update)
     if (isCategoryMove) {
         const newCategory = targetFolder.toLowerCase();
-
-        // 1. Determine the Sender Rule
         let valueToLearn = null;
         if (email.senderAddr && email.senderAddr.includes('@')) {
             const domain = email.senderAddr.split('@')[1].toLowerCase();
             const genericProviders = ['gmail.com', 'outlook.com', 'yahoo.com', 'icloud.com', 'hotmail.com'];
-            
-            // If generic, learn full address. If business, learn domain.
-            valueToLearn = genericProviders.includes(domain) 
-                ? email.senderAddr.toLowerCase() 
-                : domain;
+            valueToLearn = genericProviders.includes(domain) ? email.senderAddr.toLowerCase() : domain;
         }
-
-        // 2. BULK UPDATE: Move ALL existing emails from this sender to the new tab
-        //    (If we identified a rule, use that. Otherwise just use the specific email's sender address)
-        const senderQuery = valueToLearn 
-            ? { $or: [ { senderAddr: { $regex: valueToLearn, $options: 'i' } }, { from: { $regex: valueToLearn, $options: 'i' } } ] }
-            : { senderAddr: email.senderAddr }; // Fallback
-
-        await EmailModel.updateMany(
-            { user, ...senderQuery }, 
-            { category: newCategory }
-        );
-        
-        // 3. Save the Rule for FUTURE emails
+        const senderQuery = valueToLearn ? { $or: [ { senderAddr: { $regex: valueToLearn, $options: 'i' } }, { from: { $regex: valueToLearn, $options: 'i' } } ] } : { senderAddr: email.senderAddr }; 
+        await EmailModel.updateMany({ user, ...senderQuery }, { category: newCategory });
         if (valueToLearn) {
             await SmartRuleModel.findOneAndUpdate(
                 { user, category: newCategory, value: valueToLearn },
@@ -341,30 +406,22 @@ app.post('/api/v1/mail/move', async (req, res) => {
                 { upsert: true }
             );
             await redis.del(`smart_rules:${user}`); 
-            console.log(`🧠 SMART LEARN & BULK MOVE: ${valueToLearn} -> ${targetFolder}`);
         }
-        
-        // 4. Clear Cache so the user sees the changes on refresh
         await redis.del(`mail:${user}:list:Inbox:all`);
         await redis.del(`mail:${user}:list:Inbox:primary`);
         await redis.del(`mail:${user}:list:Inbox:social`);
         await redis.del(`mail:${user}:list:Inbox:updates`);
         await redis.del(`mail:${user}:list:Inbox:promotions`);
-        
         res.json({ status: 'CATEGORIZED_BULK' });
         return; 
     }
 
-    // B: HANDLE FOLDER MOVE (Archive/Trash/Inbox)
     const sourceFolder = email.folder || 'Inbox';
     await EmailModel.findOneAndUpdate({ id: emailId, user }, { folder: targetFolder });
-    
-    // Clear Caches
     await redis.del(`mail_obj:${emailId}:${user}`);
     await redis.del(`mail:${user}:list:${sourceFolder}:all`); 
     await redis.del(`mail:${user}:list:${targetFolder}:all`);
 
-    // IMAP Move
     const client = activeClients.get(user);
     if (client && client.usable) {
         (async () => {
@@ -388,7 +445,6 @@ app.post('/api/v1/mail/move', async (req, res) => {
   }
 });
 
-// 🛑 NEW: Smart Rules API
 app.get('/api/v1/smart-rules', async (req, res) => {
     const { user } = req.query;
     const rules = await SmartRuleModel.find({ user }).sort({ category: 1 });
@@ -415,7 +471,6 @@ app.delete('/api/v1/smart-rules/:id', async (req, res) => {
     res.json({ status: 'DELETED' });
 });
 
-// Label Management
 app.get('/api/v1/labels', async (req, res) => {
     const { user } = req.query;
     if (!user) return res.json([]);
