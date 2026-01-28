@@ -4,6 +4,8 @@ import { convert } from 'html-to-text';
 // 🛑 NEW: File System imports for Attachments
 import fs from 'fs/promises';
 import path from 'path';
+// 🛑 NEW: Import mime-types helper
+import { extension } from 'mime-types';
 import { redis, EmailModel, UserConfigModel, SmartRuleModel } from './db';
 
 const BG_WORKER_COUNT = 10;
@@ -160,10 +162,14 @@ export async function startWorkerSwarm(config: any) {
     if (userWorkers.has(config.user)) return; 
     userWorkers.set(config.user, true);
     console.log(`🚀 Spawning ${BG_WORKER_COUNT} Workers for ${config.user}`);
+    
     for (let i = 0; i < BG_WORKER_COUNT; i++) {
         if (!isSystemRunning) break; // 🛑 Stop spawning if kill switch hit
-        runWorker(i, config).catch(e => console.error(`Worker ${i} died:`, e));
-        await new Promise(r => setTimeout(r, 500)); 
+        // 🛑 NEW: Add jitter to prevent all workers hitting IMAP at the exact same ms
+        const jitter = Math.random() * 2000;
+        setTimeout(() => {
+            runWorker(i, config).catch(e => console.error(`Worker ${i} died:`, e));
+        }, i * 500 + jitter);
     }
 }
 
@@ -190,8 +196,8 @@ async function runWorker(workerId: number, config: any) {
             return true;
         } catch (e: any) {
             updateWorkerState(workerId, 'ERROR');
-            if (e.responseText && e.responseText.includes('Too many simultaneous')) {
-                console.warn(`🛑 GMAIL OVERLOAD: Pausing workers.`);
+            if (e.responseText && (e.responseText.includes('Too many') || e.responseText.includes('allowed'))) {
+                console.warn(`🛑 GMAIL RATE LIMIT: Backing off workers for 30s.`);
                 connectionBackoffUntil = Date.now() + 30000;
             }
             return false;
@@ -206,7 +212,7 @@ async function runWorker(workerId: number, config: any) {
             updateWorkerState(workerId, 'TERMINATED');
             break; 
         }
-        if (Date.now() < connectionBackoffUntil) { await new Promise(r => setTimeout(r, 1000)); continue; }
+        if (Date.now() < connectionBackoffUntil) { await new Promise(r => setTimeout(r, 2000)); continue; }
         if (Date.now() - lastActionTime > 25000 && client?.usable) { try { await client.noop(); lastActionTime = Date.now(); } catch(e) {} }
 
         const job = queue.pop();
@@ -245,16 +251,31 @@ async function runWorker(workerId: number, config: any) {
             body = body.replace(/src=["'](https?:\/\/[^"']+)["']/gi, (match, url) => `src="/api/v1/proxy/image?url=${encodeURIComponent(url)}"`);
             const preview = generateSmartSnippet(body);
 
-            // 🛑 2. Download Attachments
+            // 🛑 2. Download Attachments with Smart Naming
             const attachmentParts = findAttachmentParts(msg.bodyStructure);
             const savedAttachments: any[] = [];
 
             for (const part of attachmentParts) {
                 if (!part.part) continue;
                 try {
-                    // Create a unique, safe filename
-                    const safeFilename = (part.filename || 'unnamed').replace(/[^a-z0-9.]/gi, '_');
-                    const uniqueFilename = `${Date.now()}-${Math.round(Math.random()*1000)}-${safeFilename}`;
+                    // 🛑 FIX: Smarter Filename Detection
+                    let originalName = part.filename || part.parameters?.name || part.dispositionParameters?.filename;
+                    const mimeType = part.type || 'application/octet-stream';
+                    
+                    // Detect correct extension
+                    const ext = extension(mimeType);
+
+                    if (!originalName) {
+                        // Fallback name if none exists
+                        originalName = `attachment-${Date.now()}.${ext || 'bin'}`;
+                    } else if (ext && !path.extname(originalName)) {
+                        // If name exists but has no extension, append it
+                        originalName = `${originalName}.${ext}`;
+                    }
+
+                    // Sanitize filename
+                    const safeName = originalName.replace(/[^a-z0-9.-]/gi, '_');
+                    const uniqueFilename = `${Date.now()}-${Math.round(Math.random()*1000)}-${safeName}`;
                     const filePath = path.join(ATTACHMENT_DIR, uniqueFilename);
                     
                     // Stream download to disk
@@ -262,10 +283,10 @@ async function runWorker(workerId: number, config: any) {
                     if (attStream && attStream.content) {
                         await fs.writeFile(filePath, attStream.content);
                         savedAttachments.push({
-                            filename: part.filename || 'unnamed',
-                            path: uniqueFilename, // Save relative path
+                            filename: originalName, // Use readable name for display
+                            path: uniqueFilename,   // Use unique name for storage
                             size: part.size || 0,
-                            mimeType: part.type,
+                            mimeType: mimeType,
                             cid: part.id // Support for inline images
                         });
                     }
@@ -294,10 +315,24 @@ async function runWorker(workerId: number, config: any) {
             systemStats.jobsCompleted++;
             queue.done(job.id);
         } catch (e: any) {
-            systemStats.jobsFailed++;
-            queue.done(job.id); 
-            if (job.attempts < 3) { job.attempts++; systemStats.jobsRetried++; setTimeout(() => { queue.add(job); }, 2000); }
-            if (e.code === 'ETIMEOUT' || (e.message && (e.message.includes('closed') || e.message.includes('Socket')))) await connect();
+            // FIX: If specific FETCH error, just log warning and retry later, DO NOT BACKOFF EVERYTHING
+            if (e.responseText && e.responseText.includes('not allowed')) {
+                console.warn(`⚠️ Worker ${workerId} hit rate limit on item ${job.id}. Re-queuing.`);
+                if (job.attempts < 5) {
+                    setTimeout(() => queue.add(job), 5000); 
+                }
+                queue.done(job.id); 
+                // Pause this specific worker briefly
+                await new Promise(r => setTimeout(r, 5000));
+            } else {
+                systemStats.jobsFailed++;
+                queue.done(job.id); 
+                if (job.attempts < 3) { 
+                    job.attempts++; 
+                    setTimeout(() => { queue.add(job); }, 2000); 
+                }
+                if (e.code === 'ETIMEOUT' || (e.message && (e.message.includes('closed') || e.message.includes('Socket')))) await connect();
+            }
         }
     }
 }
@@ -383,7 +418,8 @@ export async function saveBatch(messages: any[], folder: string, user: string, q
     await EmailModel.bulkWrite(ops);
     await redis.del(`mail:${user}:list:${folder}`);
     const ids = messages.map(m => `uid-${m.uid}-${folder}`);
-    const needsWork = await EmailModel.find({ id: { $in: ids }, isFullBody: false }, { id: 1, uid: 1 }).lean();
+    // 🛑 Optimization: Sync recent emails immediately
+    const needsWork = await EmailModel.find({ id: { $in: ids }, isFullBody: false }, { id: 1, uid: 1 }).sort({timestamp: -1}).limit(20).lean();
     needsWork.forEach(doc => { queue.add({ id: doc.id, priority: 4, addedAt: Date.now(), data: { uid: doc.uid!, folder: folder, user }, attempts: 0 }); });
 }
 
@@ -438,34 +474,30 @@ export async function runFullSync(client: ImapFlow, user: string) {
       console.log(`📂 MOUNTING: ${standardName} (Path: ${realPath})`);
       if (client.mailbox) await client.mailboxClose();
       let lock;
+      // 🛑 Delay to prevent lock contention with workers
+      await new Promise(r => setTimeout(r, 500));
       try { lock = await client.getMailboxLock(realPath); } catch (e) { continue; }
       try {
         const mailbox = client.mailbox;
         if (mailbox.exists === 0) continue;
         await redis.del(`mail:${user}:list:${standardName}`);
-        const totalToSync = 400;
-        const batchSize = (standardName === 'Sent') ? 25 : 50; 
+        
+        const totalToSync = (standardName === 'Inbox') ? 200 : 50; 
+        const batchSize = 25; 
         const top = mailbox.exists;
         const bottom = Math.max(1, top - totalToSync);
+        
         if (mailbox.exists < 100) {
              await syncRangeAtomic(client, `1:${mailbox.exists}`, standardName, user, queue, 10);
         } else {
             for (let i = top; i > bottom; i -= batchSize) {
-                if (!isSystemRunning) break; // 🛑 Check Lock
+                if (!isSystemRunning) break;
                 const from = Math.max(bottom, i - batchSize + 1);
                 const to = i;
                 const range = `${from}:${to}`;
                 try {
-                    const saveSize = (i === top) ? 5 : 10;
-                    await syncRangeAtomic(client, range, standardName, user, queue, saveSize);
-                } catch (e) {
-                   for (let j = to; j >= from; j -= 10) {
-                       if (!isSystemRunning) break;
-                       const subFrom = Math.max(from, j - 9);
-                       const subRange = `${subFrom}:${j}`;
-                       try { await syncRangeAtomic(client, subRange, standardName, user, queue, 1); } catch (err2) {}
-                   }
-                }
+                    await syncRangeAtomic(client, range, standardName, user, queue, 10);
+                } catch (e) {}
             }
         }
       } finally { lock.release(); }
@@ -475,7 +507,7 @@ export async function runFullSync(client: ImapFlow, user: string) {
   if (isSystemRunning) {
       await UserConfigModel.findOneAndUpdate({ user }, { setupComplete: true, lastSync: Date.now() });
       await redis.setex(`sync_progress:${user}`, 60, JSON.stringify({ status: 'IDLE', percent: 100 }));
-      console.log(`🎉 FIRST SYNC COMPLETE for ${user}. Background sync enabled.`);
+      console.log(`🎉 FIRST SYNC COMPLETE for ${user}.`);
   }
 }
 
@@ -516,7 +548,7 @@ export function preWarmCache(emails: any[], user: string) {
 }
 
 export async function spawnBackgroundClient(cfg: any) {
-    if (!isSystemRunning) return; // 🛑 Check Lock
+    if (!isSystemRunning) return;
     if (activeClients.has(cfg.user)) return;
     try {
         const client = new ImapFlow({
@@ -533,7 +565,7 @@ export async function spawnBackgroundClient(cfg: any) {
 }
 
 setInterval(() => {
-    if (!isSystemRunning) return; // 🛑 Check Lock
+    if (!isSystemRunning) return;
     if (activeClients.size > 0) {
         activeClients.forEach((client, user) => {
             const lastRun = syncCooldowns.get(user) || 0;

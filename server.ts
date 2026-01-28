@@ -10,10 +10,12 @@ import { fileURLToPath } from 'url';
 import { ImapFlow } from 'imapflow';
 import nodemailer from 'nodemailer';
 import multer from 'multer';
+import MailComposer from 'nodemailer/lib/mail-composer/index.js';
+import { simpleParser } from 'mailparser'; 
 
 import { redis, connectDB, EmailModel, UserConfigModel, LabelModel, SmartRuleModel } from './db';
 import { resolveBrandLogo, resolveBrandName, TRANSPARENT_PIXEL } from './logo-engine';
-import { startWorkerSwarm, runFullSync, runQuickSync, getQueue, activeClients, syncLocks, syncCooldowns, userWorkers, workerState, systemStats, getFolderMap, preWarmCache, spawnBackgroundClient, killSwarm } from './workers';
+import { startWorkerSwarm, runFullSync, runQuickSync, getQueue, activeClients, syncLocks, syncCooldowns, userWorkers, workerState, systemStats, getFolderMap, preWarmCache, spawnBackgroundClient, killSwarm, syncRangeAtomic } from './workers';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,6 +24,24 @@ const app = express();
 const CACHE_DIR = path.join(process.cwd(), 'img_cache');
 const ATTACHMENT_DIR = path.join(process.cwd(), 'attachments');
 const REDIS_TTL = 86400; 
+
+// 🛑 DEBUGGING: In-Memory Draft Logs
+const draftLogs: { time: string, id: string, msg: string, type: 'info'|'success'|'error' }[] = [];
+const logDraft = (id: string, msg: string, type: 'info'|'success'|'error' = 'info') => {
+    const time = new Date().toLocaleTimeString();
+    draftLogs.unshift({ time, id, msg, type });
+    if (draftLogs.length > 50) draftLogs.pop();
+    console.log(`[DraftLog] ${msg}`);
+};
+
+// Global Error Handler
+process.on('uncaughtException', (err: any) => {
+    if (err.code === 'ETIMEOUT' || err.message?.includes('Socket timeout')) {
+        console.warn('⚠️ Caught socket timeout (prevented crash)');
+    } else {
+        console.error('🚨 Uncaught Exception:', err);
+    }
+});
 
 // Configure Multer for Disk Storage
 const storage = multer.diskStorage({
@@ -141,10 +161,25 @@ app.post('/api/v1/mail/sync', async (req, res) => {
     try {
         const getClient = async (cfg: any) => {
             if (activeClients.has(cfg.user)) return activeClients.get(cfg.user)!;
+            
             const client = new ImapFlow({
-                host: cfg.imapHost, port: cfg.imapPort, secure: cfg.useTLS || cfg.imapPort === 993,
-                auth: { user: cfg.user, pass: cfg.pass }, logger: false, clientTimeout: 60000, 
+                host: cfg.imapHost, 
+                port: cfg.imapPort, 
+                secure: cfg.useTLS || cfg.imapPort === 993,
+                auth: { user: cfg.user, pass: cfg.pass }, 
+                logger: false, 
+                clientTimeout: 90000, 
             });
+
+            client.on('error', (err) => {
+                console.error(`❌ IMAP Client Error (${cfg.user}):`, err.message);
+                if (activeClients.get(cfg.user) === client) activeClients.delete(cfg.user);
+            });
+            
+            client.on('close', () => {
+                if (activeClients.get(cfg.user) === client) activeClients.delete(cfg.user);
+            });
+
             await client.connect();
             activeClients.set(cfg.user, client);
             return client;
@@ -186,7 +221,7 @@ app.get('/api/v1/mail/list', async (req, res) => {
   res.json(listData);
 });
 
-// 🛑 UPDATED: Email Detail Fetch with Polling Logic
+// Email Detail Fetch with Polling Logic
 app.get('/api/v1/mail/:id', async (req, res) => {
   const { id } = req.params;
   const { user } = req.query;
@@ -209,7 +244,6 @@ app.get('/api/v1/mail/:id', async (req, res) => {
   // 3. Not found or partial body? Queue it and WAIT (Polling).
   if (l2) {
       const queue = getQueue(user as string);
-      // Priority 1 jumps to the front of the queue
       queue.add({ 
           id: l2.id, 
           priority: 1, 
@@ -218,14 +252,11 @@ app.get('/api/v1/mail/:id', async (req, res) => {
           attempts: 0 
       });
 
-      // 🛑 POLLING LOOP: Wait for worker to finish (Max 10 seconds)
-      const MAX_ATTEMPTS = 20; // 20 * 500ms = 10s
-      const INTERVAL = 500; // ms
+      const MAX_ATTEMPTS = 20; 
+      const INTERVAL = 500; 
 
       for (let i = 0; i < MAX_ATTEMPTS; i++) {
           await new Promise(resolve => setTimeout(resolve, INTERVAL));
-          
-          // Check Redis again (Workers write to Redis upon completion)
           const check = await redis.get(cacheKey);
           if (check) {
               const freshData = JSON.parse(check);
@@ -233,8 +264,7 @@ app.get('/api/v1/mail/:id', async (req, res) => {
                   return res.json({ email: freshData, source: 'Worker-Live' });
               }
           }
-          // Optional: Check DB if Redis failed (double safety)
-          if (i % 4 === 0) { // Check DB every 2 seconds
+          if (i % 4 === 0) { 
              const dbCheck = await EmailModel.findOne({ id, user }, { isFullBody: 1 });
              if (dbCheck && dbCheck.isFullBody) {
                  const fullDoc = await EmailModel.findOne({ id, user });
@@ -244,9 +274,270 @@ app.get('/api/v1/mail/:id', async (req, res) => {
           }
       }
   }
-
-  // If we time out after 10s, return 408
   res.status(408).json({ error: 'Fetch timed out - Worker busy' });
+});
+
+// 🛑 BATCH DELETE - UPDATED WITH IMAP SYNC
+app.post('/api/v1/mail/batch-delete', async (req, res) => {
+    const { ids, user } = req.body;
+    if (!ids || !Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'No IDs provided' });
+
+    try {
+        // 1. Fetch details before deletion so we know WHERE to delete from IMAP
+        const emailsToDelete = await EmailModel.find({ id: { $in: ids }, user }, { uid: 1, folder: 1 });
+
+        // 2. Delete from Mongo (Optimistic)
+        await EmailModel.deleteMany({ id: { $in: ids }, user });
+        
+        // 3. Clear Cache
+        for (const id of ids) await redis.del(`mail_obj:${id}:${user}`);
+        const folders = ['Inbox', 'Trash', 'Spam', 'Drafts', 'Sent'];
+        for (const f of folders) await redis.del(`mail:${user}:list:${f}:all`);
+
+        res.json({ status: 'DELETED_OPTIMISTIC', count: ids.length });
+
+        // 🛑 4. PERFORM REAL IMAP DELETION
+        const client = activeClients.get(user as string);
+        if (client && client.usable && emailsToDelete.length > 0) {
+            (async () => {
+                try {
+                    const map = await getFolderMap(client, user as string);
+                    
+                    // Group by folder to handle deletions across different mailboxes
+                    const deletesByFolder: Record<string, string[]> = {};
+                    
+                    for (const email of emailsToDelete) {
+                        const folder = email.folder || 'Trash';
+                        if (!deletesByFolder[folder]) deletesByFolder[folder] = [];
+                        if (email.uid) deletesByFolder[folder].push(email.uid.toString());
+                    }
+
+                    // Execute deletion per folder
+                    for (const [folderName, uids] of Object.entries(deletesByFolder)) {
+                        const path = map[folderName];
+                        if (path && uids.length > 0) {
+                            const lock = await client.getMailboxLock(path);
+                            try {
+                                const uidString = uids.join(',');
+                                console.log(`🗑️ IMAP: Deleting ${uids.length} messages from ${folderName} (UIDs: ${uidString})`);
+                                await client.messageFlagsAdd(uidString, ['\\Deleted'], { uid: true });
+                                await client.messageDelete(uidString, { uid: true });
+                            } catch(e) {
+                                console.error(`IMAP Delete Failed [${folderName}]:`, e);
+                            } finally {
+                                lock.release();
+                            }
+                        }
+                    }
+                } catch (err) { console.error("Background Batch Delete Error", err); }
+            })();
+        }
+    } catch (e) {
+        console.error("Batch Delete Error", e);
+        res.status(500).json({ error: 'Batch delete failed' });
+    }
+});
+
+app.delete('/api/v1/mail/:id', async (req, res) => {
+    const { id } = req.params;
+    const { user } = req.query;
+    try {
+        const email = await EmailModel.findOne({ id, user });
+        if (!email) return res.status(404).json({ error: 'Email not found' });
+
+        await EmailModel.deleteOne({ id, user });
+        await redis.del(`mail_obj:${id}:${user}`);
+        if (email.folder) await redis.del(`mail:${user}:list:${email.folder}:all`);
+
+        const client = activeClients.get(user as string);
+        if (client && client.usable) {
+            const map = await getFolderMap(client, user as string);
+            const folderPath = map[email.folder || 'Trash'];
+            if (folderPath && email.uid) {
+                (async () => {
+                    const lock = await client.getMailboxLock(folderPath);
+                    try {
+                        await client.messageFlagsAdd(email.uid, ['\\Deleted'], { uid: true });
+                        await client.messageDelete(email.uid, { uid: true });
+                    } catch(e) {} finally { lock.release(); }
+                })();
+            }
+        }
+        res.json({ status: 'PERMANENTLY_DELETED' });
+    } catch (e) {
+        res.status(500).json({ error: 'Delete failed' });
+    }
+});
+
+// 🛑 DRAFT SAVE - WITH SYNCHRONIZED DB CLEANUP
+app.post('/api/v1/mail/draft', upload.array('files', 10), async (req, res) => {
+    const { user, to, subject, body, id } = req.body;
+    
+    // 🛑 DEBUG: Start
+    logDraft(id, `Start save request for: ${subject}`, 'info');
+
+    const client = activeClients.get(user);
+    if (!client || !client.usable) {
+        logDraft(id, 'Sync offline - failed to get client', 'error');
+        return res.status(503).json({ error: 'Sync offline' });
+    }
+
+    // 🛑 DB PERSISTENCE PREPARATION
+    let newUid: number | undefined;
+    const hasAttachments = (req.files && req.files.length > 0) || false;
+    let finalAttachments: any[] = []; 
+
+    try {
+        const map = await getFolderMap(client, user);
+        const draftsPath = map['Drafts'];
+        if (!draftsPath) return res.status(404).json({ error: 'Drafts folder not found' });
+
+        const lock = await client.getMailboxLock(draftsPath);
+        try {
+            // --- ATTACHMENT HANDLING ---
+            if (req.files && Array.isArray(req.files)) {
+                (req.files as Express.Multer.File[]).forEach(f => {
+                    finalAttachments.push({ filename: f.originalname, path: f.path });
+                });
+            }
+
+            const uidsToDelete = new Set<string>();
+            let oldDraftSource: Buffer | null = null;
+
+            if (id) {
+                // 🛑 STRATEGY 1: ID is a UID?
+                const uidMatch = id.match(/uid-(\d+)-/);
+                if (uidMatch && uidMatch[1]) {
+                     uidsToDelete.add(uidMatch[1]);
+                     logDraft(id, `Matched UID in ID: ${uidMatch[1]}`, 'info');
+                }
+
+                // 🛑 STRATEGY 2: Header Match (Stable ID)
+                try {
+                    const headerSearch = { header: { 'X-Mailboy-Draft-ID': id } };
+                    for await (const msg of client.fetch(headerSearch, { uid: true, source: true })) {
+                        uidsToDelete.add(msg.uid.toString());
+                        if (!oldDraftSource) oldDraftSource = msg.source; 
+                    }
+                } catch(e) {}
+                
+                // 🛑 STRATEGY 3: CONTENT MATCH (Aggressive Deduplication)
+                // If To/Subject match exactly, we assume it's the same draft and nuke the old ones.
+                if (to && subject) {
+                     // logDraft(id, `Checking for duplicates by content...`, 'info');
+                     const contentSearch = { header: { to: to, subject: subject } };
+                     try {
+                         for await (const msg of client.fetch(contentSearch, { uid: true, source: true })) {
+                            uidsToDelete.add(msg.uid.toString());
+                            if (!oldDraftSource) oldDraftSource = msg.source;
+                         }
+                     } catch(e) {}
+                }
+
+                // Attempt attachment recovery
+                if (oldDraftSource && finalAttachments.length === 0) {
+                    try {
+                        const parsed = await simpleParser(oldDraftSource);
+                        if (parsed.attachments && parsed.attachments.length > 0) {
+                            parsed.attachments.forEach(att => {
+                                finalAttachments.push({
+                                    filename: att.filename,
+                                    content: att.content, 
+                                    contentType: att.contentType
+                                });
+                            });
+                        }
+                    } catch (err) { }
+                }
+            }
+
+            // 🛑 EXECUTE DELETE (IMAP + MONGO)
+            if (uidsToDelete.size > 0) {
+                const uidString = Array.from(uidsToDelete).join(',');
+                const uidsArray = Array.from(uidsToDelete).map(u => parseInt(u));
+                
+                logDraft(id, `🔥 Scorched Earth: Deleting UIDs ${uidString} from IMAP & DB`, 'info');
+                
+                // 1. DELETE FROM IMAP
+                await client.messageFlagsAdd(uidString, ['\\Deleted'], { uid: true });
+                await client.messageDelete(uidString, { uid: true }); 
+                
+                // 2. DELETE FROM MONGO IMMEDIATELY (Fixes the UI Duplicate Bug)
+                await EmailModel.deleteMany({ uid: { $in: uidsArray }, user });
+            }
+
+            const mail = new MailComposer({
+                from: user,
+                to: to,
+                subject: subject,
+                html: body,
+                text: body.replace(/<[^>]*>?/gm, ''),
+                headers: { 'X-Mailboy-Draft-ID': id },
+                attachments: finalAttachments
+            });
+
+            const messageBuffer = await mail.compile().build();
+            
+            // 🛑 SAFE APPEND
+            try {
+                const appendResult = await client.append(draftsPath, messageBuffer, ['\\Draft']);
+                if (appendResult && appendResult.uid) {
+                    newUid = appendResult.uid;
+                    logDraft(id, `IMAP Append success. UID: ${newUid}`, 'success');
+                } else {
+                    logDraft(id, `UID missing. Triggering fallback search...`, 'info');
+                    const checkSearch = { header: { 'X-Mailboy-Draft-ID': id } };
+                    for await (const msg of client.fetch(checkSearch, { uid: true })) {
+                        newUid = msg.uid;
+                        logDraft(id, `Fallback search recovered UID: ${newUid}`, 'success');
+                        break;
+                    }
+                }
+            } catch (imapErr: any) {
+                logDraft(id, `IMAP Append Failed: ${imapErr.message}. Saving to DB anyway.`, 'error');
+            }
+
+        } finally {
+            lock.release();
+        }
+        
+        await redis.del(`mail:${user}:list:Drafts`);
+
+        // 🛑 GUARANTEED DB PERSISTENCE
+        const finalDbId = newUid ? `uid-${newUid}-${user}` : id;
+        
+        await EmailModel.findOneAndUpdate(
+             { id: finalDbId },
+             {
+                 id: finalDbId,
+                 uid: newUid || 0, 
+                 user: user,
+                 folder: 'Drafts',
+                 from: user,
+                 to: to,
+                 subject: subject,
+                 body: body,
+                 preview: body.replace(/<[^>]*>?/gm, '').substring(0, 150),
+                 timestamp: Date.now(),
+                 read: true,
+                 labels: [],
+                 isFullBody: true,
+                 hasAttachments: finalAttachments.length > 0,
+                 attachments: finalAttachments.map(a => ({ 
+                     filename: a.filename, 
+                     contentType: a.contentType,
+                     size: a.content ? a.content.length : 0 
+                 })) 
+             },
+             { upsert: true, new: true }
+        );
+        logDraft(id, `✅ DB SAVED! ID: ${finalDbId} (UID: ${newUid || 'Pending'})`, 'success');
+
+        res.json({ status: 'SAVED', id: finalDbId, timestamp: Date.now() });
+    } catch (e: any) {
+        logDraft(id, `🔥 FATAL ERROR: ${e.message}`, 'error');
+        res.status(500).json({ error: e.message });
+    }
 });
 
 app.get('/api/v1/proxy/image', async (req, res) => {
@@ -280,18 +571,31 @@ app.get('/api/v1/proxy/image', async (req, res) => {
   }
 });
 
+// Robust System Reset
 app.delete('/api/v1/debug/reset', async (req, res) => {
   try {
-    await killSwarm();
+    console.log("☢️ NUCLEAR RESET INITIATED");
+    try {
+        await Promise.race([
+            killSwarm(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Swarm Kill Timeout')), 3000))
+        ]);
+    } catch (e) { }
+
+    for (const [user, client] of activeClients.entries()) {
+        try { client.close(); } catch (e) {}
+        activeClients.delete(user);
+    }
+
     await redis.flushall();
     await EmailModel.deleteMany({});
     await UserConfigModel.deleteMany({});
     await LabelModel.deleteMany({});
     await SmartRuleModel.deleteMany({}); 
+    
     console.log("✨ System Reset Cleanly");
     res.json({ status: 'SYSTEM_WIPED' });
   } catch (e) { 
-    console.error(e);
     res.status(500).json({ error: 'WIPE_FAILED' }); 
   }
 });
@@ -301,15 +605,17 @@ app.get('/api/v1/debug/workers', (req, res) => {
         workers: workerState.map(w => ({ ...w, ageMs: w.status === 'WORKING' ? Date.now() - w.lastActivity : 0 })),
         system: systemStats,
         locks: Array.from(syncLocks.keys()),
+        draftLogs, // 🛑 EXPOSE LOGS
         timestamp: Date.now()
     });
 });
 
 app.get('/monitor', (req, res) => {
-    res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Mailboy Console</title><style>body{background:#0f172a;color:#e2e8f0;font-family:'Courier New',monospace;padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:20px}.card{background:#1e293b;padding:15px;border-radius:8px;border:1px solid #334155}.card.working{border-color:#22c55e;box-shadow:0 0 10px rgba(34,197,94,0.2)}.card.error{border-color:#ef4444}h1{font-size:1.5rem;margin-bottom:10px;color:#38bdf8}.stat-val{font-size:1.5rem;font-weight:bold}.stat-label{color:#94a3b8;font-size:0.8rem}</style></head><body><div style="display:flex;justify-content:space-between;align-items:center;"><h1>⚡ Mailboy Swarm</h1><div id="clock">--:--:--</div></div><div class="grid"><div class="card"><div class="stat-val" id="jobsCompleted">0</div><div class="stat-label">Jobs Done</div></div><div class="card"><div class="stat-val" id="queueSize">0</div><div class="stat-label">Queue</div></div><div class="card"><div class="stat-val" id="activeLocks">0</div><div class="stat-label">Active Syncs</div></div></div><h3>Workers</h3><div class="grid" id="workerGrid"></div><script>function update(){fetch('/api/v1/debug/workers').then(r=>r.json()).then(data=>{document.getElementById('jobsCompleted').innerText=data.system.jobsCompleted;document.getElementById('queueSize').innerText=data.queue?.pending||0;document.getElementById('activeLocks').innerText=data.locks.length;const grid=document.getElementById('workerGrid');grid.innerHTML=data.workers.map(w=>{const statusClass=w.status==='WORKING'?'working':(w.status==='ERROR'?'error':'');return \`<div class="card \${statusClass}"><div><strong>Worker \${w.id}</strong></div><div style="color:\${w.status==='WORKING'?'#4ade80':'#64748b'}">\${w.status}</div>\${w.status==='WORKING'?\`<div style="font-size:0.75rem;margin-top:5px;word-break:break-all;">\${w.jobId}</div><div style="font-size:0.75rem;color:#facc15;">\${(w.ageMs/1000).toFixed(1)}s</div><div style="font-size:0.75rem;color:#94a3b8;">📂 \${w.folder}</div>\`:''}</div>\`}).join('');document.getElementById('clock').innerText=new Date().toLocaleTimeString()})}setInterval(update,1000);update();</script></body></html>`);
+    res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Mailboy Console</title><style>body{background:#0f172a;color:#e2e8f0;font-family:'Courier New',monospace;padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:20px}.card{background:#1e293b;padding:15px;border-radius:8px;border:1px solid #334155}.card.working{border-color:#22c55e;box-shadow:0 0 10px rgba(34,197,94,0.2)}.card.error{border-color:#ef4444}h1{font-size:1.5rem;margin-bottom:10px;color:#38bdf8}.stat-val{font-size:1.5rem;font-weight:bold}.stat-label{color:#94a3b8;font-size:0.8rem}.logs{background:#020617;padding:10px;border-radius:8px;height:300px;overflow-y:auto;font-size:0.8rem}.log-item{margin-bottom:4px;border-bottom:1px solid #1e293b;padding-bottom:2px}.success{color:#4ade80}.error{color:#ef4444}.info{color:#94a3b8}</style></head><body><div style="display:flex;justify-content:space-between;align-items:center;"><h1>⚡ Mailboy Swarm</h1><div id="clock">--:--:--</div></div><div class="grid"><div class="card"><div class="stat-val" id="jobsCompleted">0</div><div class="stat-label">Jobs Done</div></div><div class="card"><div class="stat-val" id="queueSize">0</div><div class="stat-label">Queue</div></div><div class="card"><div class="stat-val" id="activeLocks">0</div><div class="stat-label">Active Syncs</div></div></div><h3>Draft Live Logs</h3><div class="logs" id="draftLogs"></div><h3>Workers</h3><div class="grid" id="workerGrid"></div><script>function update(){fetch('/api/v1/debug/workers').then(r=>r.json()).then(data=>{document.getElementById('jobsCompleted').innerText=data.system.jobsCompleted;document.getElementById('queueSize').innerText=data.queue?.pending||0;document.getElementById('activeLocks').innerText=data.locks.length;const logContainer=document.getElementById('draftLogs');if(data.draftLogs){logContainer.innerHTML=data.draftLogs.map(l=>\`<div class="log-item \${l.type}">[\${l.time}] \${l.msg} <span style="opacity:0.5;font-size:0.7em">(\${l.id.slice(-6)})</span></div>\`).join('');}const grid=document.getElementById('workerGrid');grid.innerHTML=data.workers.map(w=>{const statusClass=w.status==='WORKING'?'working':(w.status==='ERROR'?'error':'');return \`<div class="card \${statusClass}"><div><strong>Worker \${w.id}</strong></div><div style="color:\${w.status==='WORKING'?'#4ade80':'#64748b'}">\${w.status}</div>\${w.status==='WORKING'?\`<div style="font-size:0.75rem;margin-top:5px;word-break:break-all;">\${w.jobId}</div><div style="font-size:0.75rem;color:#facc15;">\${(w.ageMs/1000).toFixed(1)}s</div><div style="font-size:0.75rem;color:#94a3b8;">📂 \${w.folder}</div>\`:''}</div>\`}).join('');document.getElementById('clock').innerText=new Date().toLocaleTimeString()})}setInterval(update,1000);update();</script></body></html>`);
 });
 
-// SMTP Relay with Attachments
+// ... rest of the file (send, mark, move, etc) matches previous version
+// SMTP Relay
 app.post('/api/v1/mail/send', upload.array('files', 10), async (req, res) => {
   const { auth: authStr, payload: payloadStr } = req.body;
   if (!authStr || !payloadStr) return res.status(400).json({ error: "MISSING_DATA" });
@@ -317,7 +623,8 @@ app.post('/api/v1/mail/send', upload.array('files', 10), async (req, res) => {
   try {
       const auth = JSON.parse(authStr);
       const payload = JSON.parse(payloadStr);
-      
+      const draftId = payload.draftId; 
+
       const attachments = (req.files as Express.Multer.File[] || []).map(file => ({
           filename: file.originalname,
           path: file.path
@@ -342,9 +649,60 @@ app.post('/api/v1/mail/send', upload.array('files', 10), async (req, res) => {
       });
       
       console.log(`📤 Email sent: ${info.messageId}`);
+
+      const client = activeClients.get(auth.user);
+      if (client && client.usable) {
+          const map = await getFolderMap(client, auth.user);
+          const sentPath = map['Sent']; 
+          
+          if (sentPath) {
+              const lock = await client.getMailboxLock(sentPath);
+              try {
+                  const mail = new MailComposer({
+                      from: auth.user,
+                      to: payload.to,
+                      cc: payload.cc,
+                      bcc: payload.bcc,
+                      subject: payload.subject,
+                      html: payload.body,
+                      text: payload.body.replace(/<[^>]*>?/gm, ''),
+                      attachments: attachments
+                  });
+                  const msgBuffer = await mail.compile().build();
+                  await client.append(sentPath, msgBuffer, ['\\Seen']);
+                  await redis.del(`mail:${auth.user}:list:Sent`);
+              } catch(e) { } 
+              finally { lock.release(); }
+          }
+
+          if (draftId) {
+              const draftsPath = map['Drafts'];
+              if (draftsPath) {
+                  const draftLock = await client.getMailboxLock(draftsPath);
+                  try {
+                      const searchCriteria = { header: { 'X-Mailboy-Draft-ID': draftId } };
+                      let uidsToDelete: string[] = [];
+                      for await (const msg of client.fetch(searchCriteria, { uid: true })) {
+                          uidsToDelete.push(msg.uid.toString());
+                      }
+                      if (uidsToDelete.length === 0) {
+                          const uidMatch = draftId.match(/uid-(\d+)-/);
+                          if (uidMatch) uidsToDelete.push(uidMatch[1]);
+                      }
+
+                      if (uidsToDelete.length > 0) {
+                          await client.messageFlagsAdd(uidsToDelete.join(','), ['\\Deleted'], { uid: true });
+                          await client.messageDelete(uidsToDelete.join(','), { uid: true });
+                          await redis.del(`mail:${auth.user}:list:Drafts`);
+                      }
+                  } catch (e) { } 
+                  finally { draftLock.release(); }
+              }
+          }
+      }
+
       res.json({ status: 'SENT', messageId: info.messageId });
   } catch (error: any) {
-      console.error("SMTP Relay Error:", error);
       res.status(500).json({ error: "SMTP_FAILED", details: error.message });
   }
 });
@@ -371,7 +729,7 @@ app.post('/api/v1/mail/mark', async (req, res) => {
                        if (read) await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true });
                        else await client.messageFlagsRemove(uid, ['\\Seen'], { uid: true });
                    }
-                } catch(e) { console.error("IMAP Flag Update Failed", e); } 
+                } catch(e) { } 
                 finally { lock.release(); }
             })();
         }

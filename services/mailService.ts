@@ -69,6 +69,14 @@ class HybridMailService {
     const start = performance.now();
     const response = await fetch(`${this.API_BASE}/mail/${id}?user=${encodeURIComponent(this.config.user)}`);
     
+    // Handle the 408 Timeout specifically (Worker busy)
+    if (response.status === 408) {
+        return { 
+            data: undefined, 
+            stats: { hits: 0, misses: 1, latencyMs: 0, source: 'IMAP' } // Placeholder stats
+        };
+    }
+
     if (!response.ok) {
       const errData = await response.json();
       throw new Error(errData.message || "FETCH_ERROR");
@@ -217,6 +225,26 @@ class HybridMailService {
     if (!this.config || ids.length === 0) return;
     const promises = ids.map(id => this.moveEmail(id, 'Trash'));
     await Promise.all(promises);
+  }
+
+  // 🛑 NEW: Save Draft
+  async saveDraft(to: string, subject: string, body: string, id?: string) {
+    if (!this.config) return;
+    try {
+        await fetch(`${this.API_BASE}/mail/draft`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                user: this.config.user,
+                to,
+                subject,
+                body,
+                id 
+            })
+        });
+    } catch (e) {
+        console.error("Failed to save draft:", e);
+    }
   }
 
 }
