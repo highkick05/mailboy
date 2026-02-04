@@ -1,24 +1,24 @@
 import { ImapFlow } from 'imapflow';
 import { Buffer } from 'buffer';
 import { convert } from 'html-to-text';
-// 🛑 NEW: File System imports for Attachments
 import fs from 'fs/promises';
 import path from 'path';
-// 🛑 NEW: Import mime-types helper
-import { extension } from 'mime-types';
+import { lookup, extension } from 'mime-types'; 
 import { redis, EmailModel, UserConfigModel, SmartRuleModel } from './db';
 
-const BG_WORKER_COUNT = 10;
-const REDIS_TTL = 86400;
-// 🛑 NEW: Attachments Directory
-const ATTACHMENT_DIR = path.join(process.cwd(), 'attachments');
+// 🛑 EXPORTED CONSTANTS
+export const BG_WORKER_COUNT = 5; 
+export const REDIS_TTL = 86400;
+export const ATTACHMENT_DIR = path.resolve('/app/attachments');
 
-// System State Flag (The Kill Switch)
 let isSystemRunning = true;
 
-export const workerState = new Array(BG_WORKER_COUNT).fill(null).map((_, i) => ({
-    id: i, status: 'IDLE', jobId: '', folder: '', duration: 0, lastActivity: Date.now()
+// 🛑 Shared State
+export const workerState = new Array(BG_WORKER_COUNT + 1).fill(null).map((_, i) => ({
+    id: i === BG_WORKER_COUNT ? 99 : i,
+    status: 'IDLE', jobId: '', folder: '', duration: 0, lastActivity: Date.now(), type: i === BG_WORKER_COUNT ? 'DRAFT' : 'STD'
 }));
+
 export const systemStats = { jobsCompleted: 0, jobsFailed: 0, jobsRetried: 0, startTime: Date.now() };
 export const syncLocks = new Map<string, boolean>();
 export const syncCooldowns = new Map<string, number>();
@@ -27,80 +27,84 @@ let connectionBackoffUntil = 0;
 export const userWorkers = new Map<string, boolean>();
 export const activeClients = new Map<string, ImapFlow>();
 
-// Default Keywords for Heuristic Classification
 const DEFAULT_RULES = {
-    promotions: [
-        'unsubscribe', 'opt-out', 'view in browser', 'preferences', 'terms and conditions',
-        '% off', 'sale', 'discount', 'clearance', 'promo code', 'coupon', 'free shipping',
-        'shop now', 'limited time', 'last chance', 'exclusive offer',
-        'newsletter', 'marketing', 'no-reply', 'info@', 'hello@'
-    ],
-    social: [
-        'facebook', 'twitter', 'linkedin', 'instagram', 'pinterest', 'tiktok', 'youtube', 
-        'friend request', 'follower', 'connection'
-    ],
-    updates: [
-        // Finance & Billing
-        'receipt', 'billing', 'invoice', 'order', 'confirmation', 'statement', 'payment', 'refund', 'processed', 'transfer',
-        // Shipping & Delivery
-        'tracking', 'shipment', 'shipped', 'delivered', 'package', 'courier', 'dispatch', 'arriving',
-        // Account & Security
-        'security alert', 'password reset', 'verification', 'verify', 'login', 'sign in', 'account update', 'policy update', 'terms of service',
-        // Appointments & Events
-        'appointment', 'reminder', 'schedule', 'booking', 'reservation', 'ticket',
-        // Support
-        'support request', 'ticket received', 'case #'
-    ]
+    promotions: ['unsubscribe', 'opt-out', 'sale', 'discount', 'newsletter', 'marketing'],
+    social: ['facebook', 'twitter', 'linkedin', 'instagram', 'friend request'],
+    updates: ['receipt', 'billing', 'invoice', 'order', 'tracking', 'security alert', 'password reset']
 };
 
-// Kill Swarm Function
 export const killSwarm = async () => {
-    console.log("☠️ KILL SWITCH ENGAGED: Stopping all workers...");
-    isSystemRunning = false; // Prevent new loops
-
-    // 1. Clear all user worker flags
+    isSystemRunning = false;
     userWorkers.clear();
-
-    // 2. Logout all IMAP clients
     for (const [user, client] of activeClients.entries()) {
-        try {
-            console.log(`🔌 Disconnecting ${user}...`);
-            await client.logout();
-        } catch (e) {
-            client.close(); // Force close if logout fails
-        }
+        try { await client.logout(); } catch (e) { client.close(); }
     }
     activeClients.clear();
-    
-    // 3. Reset Locks
     syncLocks.clear();
     syncCooldowns.clear();
-    
-    console.log("✅ SWARM DESTROYED.");
-    
-    // Allow restart after a brief pause
     setTimeout(() => { isSystemRunning = true; }, 1000);
 };
 
 interface Job { id: string; priority: number; data: any; addedAt: number; attempts: number; }
+
 class JobQueue {
     private jobs: Job[] = [];
     private processing = new Set<string>();
+
     add(job: Job) { 
         if (this.processing.has(job.id)) return;
+        if (job.data.type === 'DRAFT_SYNC') job.priority = 0;
+
         const existingIdx = this.jobs.findIndex(j => j.id === job.id);
         if (existingIdx !== -1) {
-            if (job.priority < this.jobs[existingIdx].priority) { this.jobs[existingIdx] = job; this.sort(); }
+            if (job.priority < this.jobs[existingIdx].priority) { 
+                this.jobs[existingIdx] = job; 
+                this.sort(); 
+            }
             return;
         }
         if (!job.attempts) job.attempts = 0;
         this.jobs.push(job);
         this.sort();
     }
-    pop(): Job | undefined { const job = this.jobs.shift(); if (job) this.processing.add(job.id); return job; }
-    done(id: string) { this.processing.delete(id); }
-    private sort() { this.jobs.sort((a, b) => (a.priority !== b.priority) ? a.priority - b.priority : a.addedAt - b.addedAt); }
-    getStats() { return { pending: this.jobs.length, processing: this.processing.size, topJobs: this.jobs.slice(0, 5) }; }
+
+    popDraft(): Job | undefined {
+        const idx = this.jobs.findIndex(j => j.data.type === 'DRAFT_SYNC');
+        if (idx !== -1) {
+            const job = this.jobs[idx];
+            this.jobs.splice(idx, 1);
+            this.processing.add(job.id);
+            return job;
+        }
+        return undefined;
+    }
+
+    popStandard(): Job | undefined {
+        const idx = this.jobs.findIndex(j => j.data.type !== 'DRAFT_SYNC');
+        if (idx !== -1) {
+            const job = this.jobs[idx];
+            this.jobs.splice(idx, 1);
+            this.processing.add(job.id);
+            return job;
+        }
+        return undefined;
+    }
+
+    done(id: string) { 
+        this.processing.delete(id); 
+    }
+
+    getStats() {
+        return {
+            pending: this.jobs.length,
+            processing: this.processing.size,
+            topJobs: this.jobs.slice(0, 5).map(j => ({ id: j.id, type: j.data.type || 'HYDRATION' }))
+        };
+    }
+
+    private sort() { 
+        this.jobs.sort((a, b) => (a.priority !== b.priority) ? a.priority - b.priority : a.addedAt - b.addedAt); 
+    }
 }
 
 const userQueues = new Map<string, JobQueue>();
@@ -109,15 +113,19 @@ export function getQueue(user: string) {
     return userQueues.get(user)!;
 }
 
-function updateWorkerState(id: number, status: string, job?: Job) {
-    workerState[id].status = status;
-    workerState[id].lastActivity = Date.now();
-    if (job) {
-        workerState[id].jobId = job.id;
-        workerState[id].folder = job.data.folder;
-    } else if (status === 'IDLE') {
-        workerState[id].jobId = '';
-        workerState[id].folder = '';
+// 🛑 EXPORTED HELPER
+export function updateWorkerState(id: number, status: string, job?: Job) {
+    const index = id === 99 ? BG_WORKER_COUNT : id;
+    if (workerState[index]) {
+        workerState[index].status = status;
+        workerState[index].lastActivity = Date.now();
+        if (job) {
+            workerState[index].jobId = job.id;
+            workerState[index].folder = job.data.folder || 'N/A';
+        } else if (status === 'IDLE') {
+            workerState[index].jobId = '';
+            workerState[index].folder = '';
+        }
     }
 }
 
@@ -132,47 +140,12 @@ export async function getFolderMap(client: ImapFlow, user: string): Promise<Reco
       else if (flags.includes('\\Drafts')) map.Drafts = name;
       else if (flags.includes('\\Trash')) map.Trash = name;
       else if (flags.includes('\\Junk')) map.Spam = name;
-      else if (name.match(/sent/i) && !map.Sent.includes('/')) map.Sent = name;
-      else if (name.match(/draft/i) && !map.Drafts.includes('/')) map.Drafts = name;
-      else if ((name.match(/trash/i) || name.match(/bin/i) || name.match(/deleted/i)) && !map.Trash.includes('/')) { map.Trash = name; }
     });
-    await redis.setex(`folder_map:${user}`, 60, JSON.stringify(map));
     return map;
   } catch (e) { return map; }
 }
 
-// 🛑 NEW: Helper to find attachment parts recursively
-function findAttachmentParts(node: any): any[] {
-    let attachments: any[] = [];
-    // Standard attachments or inline images with filenames
-    if (node.disposition === 'attachment' || (node.disposition === 'inline' && node.filename)) {
-        attachments.push(node);
-    }
-    // Recursively check children (multipart)
-    if (node.childNodes) {
-        for (const child of node.childNodes) {
-            attachments = attachments.concat(findAttachmentParts(child));
-        }
-    }
-    return attachments;
-}
-
-export async function startWorkerSwarm(config: any) {
-    if (!isSystemRunning) return; // 🛑 Check Lock
-    if (userWorkers.has(config.user)) return; 
-    userWorkers.set(config.user, true);
-    console.log(`🚀 Spawning ${BG_WORKER_COUNT} Workers for ${config.user}`);
-    
-    for (let i = 0; i < BG_WORKER_COUNT; i++) {
-        if (!isSystemRunning) break; // 🛑 Stop spawning if kill switch hit
-        // 🛑 NEW: Add jitter to prevent all workers hitting IMAP at the exact same ms
-        const jitter = Math.random() * 2000;
-        setTimeout(() => {
-            runWorker(i, config).catch(e => console.error(`Worker ${i} died:`, e));
-        }, i * 500 + jitter);
-    }
-}
-
+// 🛑 STANDARD WORKER LOGIC
 async function runWorker(workerId: number, config: any) {
     const queue = getQueue(config.user);
     let client: ImapFlow | null = null;
@@ -180,9 +153,13 @@ async function runWorker(workerId: number, config: any) {
     let lastActionTime = Date.now();
 
     const connect = async () => {
-        if (!isSystemRunning) return false; // 🛑 Check Lock
-        if (!userWorkers.has(config.user)) return false; 
-        if (Date.now() < connectionBackoffUntil) { updateWorkerState(workerId, 'COOLDOWN'); return false; }
+        if (!isSystemRunning || !userWorkers.has(config.user)) return false;
+        
+        if (Date.now() < connectionBackoffUntil) { 
+            updateWorkerState(workerId, 'COOLDOWN'); 
+            return false; 
+        }
+
         try {
             updateWorkerState(workerId, 'CONNECTING');
             if (client) try { client.close(); } catch(e) {}
@@ -196,9 +173,8 @@ async function runWorker(workerId: number, config: any) {
             return true;
         } catch (e: any) {
             updateWorkerState(workerId, 'ERROR');
-            if (e.responseText && (e.responseText.includes('Too many') || e.responseText.includes('allowed'))) {
-                console.warn(`🛑 GMAIL RATE LIMIT: Backing off workers for 30s.`);
-                connectionBackoffUntil = Date.now() + 30000;
+            if (e.responseText && (e.responseText.includes('Too many') || e.responseText.includes('THROTTLED'))) {
+                connectionBackoffUntil = Date.now() + 120000; 
             }
             return false;
         }
@@ -206,26 +182,26 @@ async function runWorker(workerId: number, config: any) {
 
     await connect();
 
-    while (isSystemRunning) { // 🛑 Loop condition now checks system state
-        if (!userWorkers.has(config.user)) { 
+    while (isSystemRunning) {
+        if (!userWorkers.has(config.user)) {
             if (client) try { client.close(); } catch(e) {}
             updateWorkerState(workerId, 'TERMINATED');
             break; 
         }
-        if (Date.now() < connectionBackoffUntil) { await new Promise(r => setTimeout(r, 2000)); continue; }
+
+        if (Date.now() < connectionBackoffUntil) { await new Promise(r => setTimeout(r, 5000)); continue; }
         if (Date.now() - lastActionTime > 25000 && client?.usable) { try { await client.noop(); lastActionTime = Date.now(); } catch(e) {} }
 
-        const job = queue.pop();
+        const job = queue.popStandard();
         if (!job) {
             updateWorkerState(workerId, 'IDLE');
-            await new Promise(r => setTimeout(r, 500));
+            await new Promise(r => setTimeout(r, 1000));
             continue;
         }
 
         updateWorkerState(workerId, 'WORKING', job);
         if (!client || !client.usable) await connect();
-        if (!userWorkers.has(config.user)) { queue.add(job); break; }
-        if (!client) { queue.add(job); await new Promise(r => setTimeout(r, 2000)); continue; }
+        if (!client) { queue.add(job); continue; }
 
         try {
             if (currentFolder !== job.data.folder) {
@@ -237,281 +213,66 @@ async function runWorker(workerId: number, config: any) {
             }
 
             const exists = await EmailModel.findOne({ id: job.id }, { isFullBody: 1 });
-            if (exists && exists.isFullBody) { queue.done(job.id); continue; }
+            if (exists?.isFullBody) { queue.done(job.id); continue; }
 
             const msg = await client.fetchOne(job.data.uid.toString(), { bodyStructure: true }, { uid: true });
             if (!msg) throw new Error("Msg not found");
 
-            // 🛑 1. Download Body
             const partId = findBestPart(msg.bodyStructure);
             const downloadResult = await client.download(job.data.uid.toString(), partId, { uid: true, peek: true });
-            if (!downloadResult || !downloadResult.content) throw new Error("Empty content");
+            if (!downloadResult?.content) throw new Error("Empty content");
 
             let body = await streamToString(downloadResult.content);
             body = body.replace(/src=["'](https?:\/\/[^"']+)["']/gi, (match, url) => `src="/api/v1/proxy/image?url=${encodeURIComponent(url)}"`);
-            const preview = generateSmartSnippet(body);
-
-            // 🛑 2. Download Attachments with Smart Naming
+            
             const attachmentParts = findAttachmentParts(msg.bodyStructure);
             const savedAttachments: any[] = [];
-
             for (const part of attachmentParts) {
                 if (!part.part) continue;
                 try {
-                    // 🛑 FIX: Smarter Filename Detection
-                    let originalName = part.filename || part.parameters?.name || part.dispositionParameters?.filename;
                     const mimeType = part.type || 'application/octet-stream';
-                    
-                    // Detect correct extension
                     const ext = extension(mimeType);
-
-                    if (!originalName) {
-                        // Fallback name if none exists
-                        originalName = `attachment-${Date.now()}.${ext || 'bin'}`;
-                    } else if (ext && !path.extname(originalName)) {
-                        // If name exists but has no extension, append it
-                        originalName = `${originalName}.${ext}`;
-                    }
-
-                    // Sanitize filename
-                    const safeName = originalName.replace(/[^a-z0-9.-]/gi, '_');
-                    const uniqueFilename = `${Date.now()}-${Math.round(Math.random()*1000)}-${safeName}`;
+                    let originalName = part.filename || `att-${Date.now()}.${ext || 'bin'}`;
+                    const uniqueFilename = `${Date.now()}-${originalName.replace(/[^a-z0-9.-]/gi, '_')}`;
                     const filePath = path.join(ATTACHMENT_DIR, uniqueFilename);
-                    
-                    // Stream download to disk
                     const attStream = await client.download(job.data.uid.toString(), part.part, { uid: true, peek: true });
-                    if (attStream && attStream.content) {
+                    if (attStream?.content) {
                         await fs.writeFile(filePath, attStream.content);
-                        savedAttachments.push({
-                            filename: originalName, // Use readable name for display
-                            path: uniqueFilename,   // Use unique name for storage
-                            size: part.size || 0,
-                            mimeType: mimeType,
-                            cid: part.id // Support for inline images
-                        });
+                        savedAttachments.push({ filename: originalName, path: uniqueFilename, size: part.size, mimeType, cid: part.id });
                     }
-                } catch (err) {
-                    console.error("Failed to download attachment", err);
-                }
+                } catch (err) { console.error("Attachment err", err); }
             }
 
             const updated = await EmailModel.findOneAndUpdate(
                 { id: job.id, user: config.user },
-                { 
-                    body, 
-                    preview, 
-                    isFullBody: true,
-                    // 🛑 Save attachment metadata to DB
-                    attachments: savedAttachments
-                },
+                { body, preview: generateSmartSnippet(body), isFullBody: true, attachments: savedAttachments },
                 { new: true, upsert: true }
             );
+            if (updated) await redis.setex(`mail_obj:${job.id}:${config.user}`, REDIS_TTL, JSON.stringify(updated));
 
-            if (updated) {
-                await redis.setex(`mail_obj:${job.id}:${config.user}`, REDIS_TTL, JSON.stringify(updated));
-                await redis.expire(`sync_active:${config.user}`, 10);
-            }
             lastActionTime = Date.now();
             systemStats.jobsCompleted++;
             queue.done(job.id);
         } catch (e: any) {
-            // FIX: If specific FETCH error, just log warning and retry later, DO NOT BACKOFF EVERYTHING
-            if (e.responseText && e.responseText.includes('not allowed')) {
-                console.warn(`⚠️ Worker ${workerId} hit rate limit on item ${job.id}. Re-queuing.`);
-                if (job.attempts < 5) {
-                    setTimeout(() => queue.add(job), 5000); 
-                }
-                queue.done(job.id); 
-                // Pause this specific worker briefly
-                await new Promise(r => setTimeout(r, 5000));
-            } else {
-                systemStats.jobsFailed++;
-                queue.done(job.id); 
-                if (job.attempts < 3) { 
-                    job.attempts++; 
-                    setTimeout(() => { queue.add(job); }, 2000); 
-                }
-                if (e.code === 'ETIMEOUT' || (e.message && (e.message.includes('closed') || e.message.includes('Socket')))) await connect();
-            }
+            systemStats.jobsFailed++;
+            queue.done(job.id);
+            if (job.attempts < 3) { job.attempts++; queue.add(job); }
+            if (e.message?.includes('closed')) await connect();
         }
     }
 }
 
-function safeTimestamp(date: any): number {
-    if (!date) return Date.now();
-    const ts = new Date(date).getTime();
-    return isNaN(ts) ? Date.now() : ts;
-}
-
-// Helper to fetch user Smart Rules
-async function getUserRules(user: string) {
-    const cacheKey = `smart_rules:${user}`;
-    const cached = await redis.get(cacheKey);
-    if (cached) return JSON.parse(cached);
-
-    const rules = await SmartRuleModel.find({ user }).lean();
-    await redis.setex(cacheKey, 3600, JSON.stringify(rules)); // Cache for 1 hour
-    return rules;
-}
-
-// Classifier Logic with Default Keywords
-async function classifyEmail(msg: any, user: string): Promise<string> {
-    const rules = await getUserRules(user);
-    const from = (msg.envelope.from?.[0]?.address || "").toLowerCase();
-    const subject = (msg.envelope.subject || "").toLowerCase();
-    
-    // 1. Check User-Defined Rules (Highest Priority)
-    for (const rule of rules) {
-        if (rule.type === 'from' && from.includes(rule.value.toLowerCase())) return rule.category;
-        if (rule.type === 'subject' && subject.includes(rule.value.toLowerCase())) return rule.category;
+export async function startWorkerSwarm(config: any) {
+    if (!isSystemRunning || userWorkers.has(config.user)) return; 
+    userWorkers.set(config.user, true);
+    for (let i = 0; i < BG_WORKER_COUNT; i++) {
+        setTimeout(() => runWorker(i, config), i * 2000); 
     }
-
-    // 2. Check Default Keywords (Heuristics)
-    if (DEFAULT_RULES.promotions.some(kw => from.includes(kw) || subject.includes(kw))) return 'promotions';
-    if (DEFAULT_RULES.social.some(kw => from.includes(kw) || subject.includes(kw))) return 'social';
-    if (DEFAULT_RULES.updates.some(kw => from.includes(kw) || subject.includes(kw))) return 'updates';
-
-    return 'primary';
+    // 🛑 Note: Draft Worker is now started by server.ts via draftWorker.ts
 }
 
-export async function saveBatch(messages: any[], folder: string, user: string, queue: JobQueue) {
-    if (!isSystemRunning) return; // 🛑 Check Lock
-    
-    // Pre-calculate categories for the batch
-    const classifiedData = await Promise.all(messages.map(async (msg) => {
-        return {
-            msg,
-            category: await classifyEmail(msg, user)
-        };
-    }));
-
-    const ops = classifiedData.map(({ msg, category }) => {
-        const f = msg.envelope.from?.[0] || {};
-        const cleanName = f.name || f.address || 'Unknown';
-        const cleanAddr = f.address || 'unknown';
-        const isRead = msg.flags.has('\\Seen');
-
-        return {
-            updateOne: {
-                filter: { id: `uid-${msg.uid}-${folder}`, user },
-                update: {
-                    $set: { 
-                        timestamp: safeTimestamp(msg.envelope.date), 
-                        read: isRead, 
-                        folder: folder,
-                        category: category // Saving Category
-                    },
-                    $setOnInsert: { 
-                        uid: msg.uid, 
-                        from: cleanAddr, 
-                        senderName: cleanName, 
-                        senderAddr: cleanAddr,
-                        to: msg.envelope.to?.[0]?.address || user, 
-                        subject: msg.envelope.subject || '(No Subject)', 
-                        body: "", preview: "", isFullBody: false 
-                    }
-                },
-                upsert: true
-            }
-        };
-    });
-    await EmailModel.bulkWrite(ops);
-    await redis.del(`mail:${user}:list:${folder}`);
-    const ids = messages.map(m => `uid-${m.uid}-${folder}`);
-    // 🛑 Optimization: Sync recent emails immediately
-    const needsWork = await EmailModel.find({ id: { $in: ids }, isFullBody: false }, { id: 1, uid: 1 }).sort({timestamp: -1}).limit(20).lean();
-    needsWork.forEach(doc => { queue.add({ id: doc.id, priority: 4, addedAt: Date.now(), data: { uid: doc.uid!, folder: folder, user }, attempts: 0 }); });
-}
-
-export async function syncRangeAtomic(client: ImapFlow, range: string, folder: string, user: string, queue: JobQueue, batchSize: number) {
-    const fetchOptions = { envelope: true, flags: true, uid: true, internalDate: true };
-    let batch: any[] = [];
-    let count = 0;
-    for await (let msg of client.fetch(range, fetchOptions)) {
-        if (!isSystemRunning) break; // 🛑 Check Lock inside loop
-        batch.push(msg);
-        count++;
-        if (batch.length >= (count === 1 ? 1 : batchSize)) { await saveBatch(batch, folder, user, queue); batch = []; }
-    }
-    if (batch.length > 0) await saveBatch(batch, folder, user, queue);
-}
-
-export async function runQuickSync(client: ImapFlow, user: string) {
-    if (!isSystemRunning) return; // 🛑 Check Lock
-    const map = await getFolderMap(client, user);
-    const inboxPath = map['Inbox'];
-    const queue = getQueue(user);
-    if (!inboxPath) return;
-    try {
-        await redis.setex(`sync_progress:${user}`, 60, JSON.stringify({ status: 'SYNCING', percent: 0 }));
-
-        if (client.mailbox) await client.mailboxClose();
-        const lock = await client.getMailboxLock(inboxPath);
-        try {
-            if (client.mailbox.exists === 0) return;
-            const range = `${Math.max(1, client.mailbox.exists - 50)}:${client.mailbox.exists}`;
-            await syncRangeAtomic(client, range, 'Inbox', user, queue, 10);
-        } finally { lock.release(); }
-    } catch (e) { console.error("Quick Sync Failed:", e); }
-    finally {
-        await redis.setex(`sync_progress:${user}`, 60, JSON.stringify({ status: 'IDLE', percent: 100 }));
-    }
-}
-
-export async function runFullSync(client: ImapFlow, user: string) {
-  if (!isSystemRunning) return; // 🛑 Check Lock
-  const map = await getFolderMap(client, user);
-  const foldersToSync = ['Inbox', 'Trash', 'Sent', 'Drafts', 'Spam'];
-  const queue = getQueue(user);
-  
-  await redis.setex(`sync_progress:${user}`, 300, JSON.stringify({ status: 'HYDRATING', percent: 1 }));
-
-  for (const standardName of foldersToSync) {
-    if (!isSystemRunning) break; // 🛑 Check Lock
-    const realPath = map[standardName];
-    if (!realPath) continue;
-    try {
-      console.log(`📂 MOUNTING: ${standardName} (Path: ${realPath})`);
-      if (client.mailbox) await client.mailboxClose();
-      let lock;
-      // 🛑 Delay to prevent lock contention with workers
-      await new Promise(r => setTimeout(r, 500));
-      try { lock = await client.getMailboxLock(realPath); } catch (e) { continue; }
-      try {
-        const mailbox = client.mailbox;
-        if (mailbox.exists === 0) continue;
-        await redis.del(`mail:${user}:list:${standardName}`);
-        
-        const totalToSync = (standardName === 'Inbox') ? 200 : 50; 
-        const batchSize = 25; 
-        const top = mailbox.exists;
-        const bottom = Math.max(1, top - totalToSync);
-        
-        if (mailbox.exists < 100) {
-             await syncRangeAtomic(client, `1:${mailbox.exists}`, standardName, user, queue, 10);
-        } else {
-            for (let i = top; i > bottom; i -= batchSize) {
-                if (!isSystemRunning) break;
-                const from = Math.max(bottom, i - batchSize + 1);
-                const to = i;
-                const range = `${from}:${to}`;
-                try {
-                    await syncRangeAtomic(client, range, standardName, user, queue, 10);
-                } catch (e) {}
-            }
-        }
-      } finally { lock.release(); }
-    } catch (e) { console.error(`Failed to sync folder ${standardName}:`, e); }
-  }
-  
-  if (isSystemRunning) {
-      await UserConfigModel.findOneAndUpdate({ user }, { setupComplete: true, lastSync: Date.now() });
-      await redis.setex(`sync_progress:${user}`, 60, JSON.stringify({ status: 'IDLE', percent: 100 }));
-      console.log(`🎉 FIRST SYNC COMPLETE for ${user}.`);
-  }
-}
-
-function findBestPart(node: any): string | null {
+// 🛑 EXPORTED UTILS
+export function findBestPart(node: any): string | null {
   const findHtml = (n: any): string | null => {
     if (n.type === 'text/html') return n.part;
     if (n.childNodes) for (const child of n.childNodes) { const res = findHtml(child); if (res) return res; }
@@ -525,7 +286,7 @@ function findBestPart(node: any): string | null {
   return findHtml(node) || findText(node) || '1';
 }
 
-function streamToString(stream: any): Promise<string> {
+export function streamToString(stream: any): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: any[] = [];
     stream.on("data", (chunk: any) => chunks.push(chunk));
@@ -534,11 +295,24 @@ function streamToString(stream: any): Promise<string> {
   });
 }
 
-function generateSmartSnippet(text: string): string {
+export function generateSmartSnippet(text: string): string {
     if (!text) return "";
     let clean = text.replace(/<style([\s\S]*?)<\/style>/gi, "").replace(/<script([\s\S]*?)<\/script>/gi, "");
     clean = convert(clean, { wordwrap: false, limits: { maxInputLength: 5000000 }, selectors: [ { selector: 'a', options: { ignoreHref: true } }, { selector: 'img', format: 'skip' } ] });
     return clean.replace(/\s+/g, " ").trim().substring(0, 160);
+}
+
+export function findAttachmentParts(node: any): any[] {
+  let attachments: any[] = [];
+  if (node.disposition === 'attachment' || (node.disposition === 'inline' && node.filename)) {
+    attachments.push(node);
+  }
+  if (node.childNodes) {
+    for (const child of node.childNodes) {
+      attachments = attachments.concat(findAttachmentParts(child));
+    }
+  }
+  return attachments;
 }
 
 export function preWarmCache(emails: any[], user: string) {
@@ -547,8 +321,146 @@ export function preWarmCache(emails: any[], user: string) {
   emails.forEach(email => { if (!email.isFullBody) queue.add({ id: email.id, priority: 2, addedAt: Date.now(), data: { uid: email.uid, folder: email.folder, user }, attempts: 0 }); });
 }
 
+function safeTimestamp(date: any): number {
+  if (!date) return Date.now();
+  const ts = new Date(date).getTime();
+  return isNaN(ts) ? Date.now() : ts;
+}
+
+async function getUserRules(user: string) {
+  const cacheKey = `smart_rules:${user}`;
+  const cached = await redis.get(cacheKey);
+  if (cached) return JSON.parse(cached);
+  const rules = await SmartRuleModel.find({ user }).lean();
+  await redis.setex(cacheKey, 3600, JSON.stringify(rules));
+  return rules;
+}
+
+async function classifyEmail(msg: any, user: string): Promise<string> {
+  const rules = await getUserRules(user);
+  const from = (msg.envelope.from?.[0]?.address || "").toLowerCase();
+  const subject = (msg.envelope.subject || "").toLowerCase();
+  for (const rule of rules) {
+    if (rule.type === 'from' && from.includes(rule.value.toLowerCase())) return rule.category;
+    if (rule.type === 'subject' && subject.includes(rule.value.toLowerCase())) return rule.category;
+  }
+  if (DEFAULT_RULES.promotions.some(kw => from.includes(kw) || subject.includes(kw))) return 'promotions';
+  if (DEFAULT_RULES.social.some(kw => from.includes(kw) || subject.includes(kw))) return 'social';
+  if (DEFAULT_RULES.updates.some(kw => from.includes(kw) || subject.includes(kw))) return 'updates';
+  return 'primary';
+}
+
+export async function saveBatch(messages: any[], folder: string, user: string, queue: JobQueue) {
+  // Check if system running? Skipped for brevity, managed by caller
+  const classifiedData = await Promise.all(messages.map(async (msg) => ({ msg, category: await classifyEmail(msg, user) })));
+  const ops = classifiedData.map(({ msg, category }) => {
+    const f = msg.envelope.from?.[0] || {};
+    const cleanName = f.name || f.address || 'Unknown';
+    const cleanAddr = f.address || 'unknown';
+    return {
+      updateOne: {
+        filter: { id: `uid-${msg.uid}-${folder}`, user },
+        update: {
+          $set: { timestamp: safeTimestamp(msg.envelope.date), read: msg.flags.has('\\Seen'), folder: folder, category: category },
+          $setOnInsert: { uid: msg.uid, from: cleanAddr, senderName: cleanName, senderAddr: cleanAddr, to: msg.envelope.to?.[0]?.address || user, subject: msg.envelope.subject || '(No Subject)', body: "", preview: "", isFullBody: false }
+        },
+        upsert: true
+      }
+    };
+  });
+  await EmailModel.bulkWrite(ops);
+  
+  await redis.del(`mail:${user}:list:${folder}`);
+  await redis.del(`mail:${user}:list:${folder}:all`);
+
+  const ids = messages.map(m => `uid-${m.uid}-${folder}`);
+  const needsWork = await EmailModel.find({ id: { $in: ids }, isFullBody: false }, { id: 1, uid: 1 }).sort({timestamp: -1}).limit(20).lean();
+  needsWork.forEach(doc => { queue.add({ id: doc.id, priority: 4, addedAt: Date.now(), data: { uid: doc.uid!, folder: folder, user }, attempts: 0 }); });
+}
+
+export async function syncRangeAtomic(client: ImapFlow, range: string, folder: string, user: string, queue: JobQueue, batchSize: number) {
+  const fetchOptions = { envelope: true, flags: true, uid: true, internalDate: true };
+  let batch: any[] = [];
+  let count = 0;
+  for await (let msg of client.fetch(range, fetchOptions)) {
+    batch.push(msg);
+    count++;
+    if (batch.length >= (count === 1 ? 1 : batchSize)) { await saveBatch(batch, folder, user, queue); batch = []; }
+  }
+  if (batch.length > 0) await saveBatch(batch, folder, user, queue);
+}
+
+export async function runQuickSync(client: ImapFlow, user: string) {
+  const map = await getFolderMap(client, user);
+  const inboxPath = map['Inbox'];
+  const queue = getQueue(user);
+  if (!inboxPath) return;
+  try {
+    await redis.setex(`sync_progress:${user}`, 60, JSON.stringify({ status: 'SYNCING', percent: 0 }));
+    if (client.mailbox) await client.mailboxClose();
+    const lock = await client.getMailboxLock(inboxPath);
+    try {
+      if (client.mailbox.exists === 0) return;
+      const range = `${Math.max(1, client.mailbox.exists - 50)}:${client.mailbox.exists}`;
+      await syncRangeAtomic(client, range, 'Inbox', user, queue, 10);
+    } finally { lock.release(); }
+  } catch (e) { console.error("Quick Sync Failed:", e); }
+  finally { await redis.setex(`sync_progress:${user}`, 60, JSON.stringify({ status: 'IDLE', percent: 100 })); }
+}
+
+export async function runFullSync(client: ImapFlow, user: string) {
+  const map = await getFolderMap(client, user);
+  const foldersToSync = ['Inbox', 'Trash', 'Sent', 'Spam']; 
+  const queue = getQueue(user);
+  await redis.setex(`sync_progress:${user}`, 300, JSON.stringify({ status: 'HYDRATING', percent: 1 }));
+  
+  // 🛑 DRAFTS removed from here (handled by DraftWorker)
+
+  // 🛑 PERCENTAGE LOGGING
+  let foldersProcessed = 0;
+  for (const standardName of foldersToSync) {
+    const realPath = map[standardName];
+    if (!realPath) continue;
+    try {
+      console.log(`📂 Syncing ${standardName} (${foldersProcessed + 1}/${foldersToSync.length})...`);
+      if (client.mailbox) await client.mailboxClose();
+      await new Promise(r => setTimeout(r, 500));
+      let lock;
+      try { lock = await client.getMailboxLock(realPath); } catch (e) { continue; }
+      try {
+        if (client.mailbox.exists === 0) continue;
+        await redis.del(`mail:${user}:list:${standardName}`);
+        await redis.del(`mail:${user}:list:${standardName}:all`);
+        const totalToSync = (standardName === 'Inbox') ? 200 : 50; 
+        const top = client.mailbox.exists;
+        const bottom = Math.max(1, top - totalToSync);
+        if (client.mailbox.exists < 100) {
+             await syncRangeAtomic(client, `1:${client.mailbox.exists}`, standardName, user, queue, 10);
+        } else {
+            for (let i = top; i > bottom; i -= 25) {
+                const from = Math.max(bottom, i - 25 + 1);
+                
+                // Progress Log
+                const processed = top - i;
+                if (processed > 0 && processed % 50 === 0) {
+                    const percent = Math.round((processed / totalToSync) * 100);
+                    console.log(`[${standardName}] ⏳ Syncing: ${percent}% complete`);
+                }
+
+                await syncRangeAtomic(client, `${from}:${i}`, standardName, user, queue, 10);
+            }
+        }
+      } finally { lock.release(); }
+    } catch (e) { console.error(`Failed to sync folder ${standardName}:`, e); }
+    foldersProcessed++;
+  }
+  
+  await UserConfigModel.findOneAndUpdate({ user }, { setupComplete: true, lastSync: Date.now() });
+  await redis.setex(`sync_progress:${user}`, 60, JSON.stringify({ status: 'IDLE', percent: 100 }));
+  console.log(`🎉 FIRST SYNC COMPLETE for ${user}.`);
+}
+
 export async function spawnBackgroundClient(cfg: any) {
-    if (!isSystemRunning) return;
     if (activeClients.has(cfg.user)) return;
     try {
         const client = new ImapFlow({
@@ -559,13 +471,10 @@ export async function spawnBackgroundClient(cfg: any) {
         activeClients.set(cfg.user, client);
         startWorkerSwarm(cfg); 
         console.log(`👻 Background Sync Session Restored: ${cfg.user}`);
-    } catch (e) {
-        console.error(`Failed to spawn background client for ${cfg.user}:`, e);
-    }
+    } catch (e) { console.error(`Failed to spawn background client:`, e); }
 }
 
 setInterval(() => {
-    if (!isSystemRunning) return;
     if (activeClients.size > 0) {
         activeClients.forEach((client, user) => {
             const lastRun = syncCooldowns.get(user) || 0;

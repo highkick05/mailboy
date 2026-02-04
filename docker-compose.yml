@@ -18,6 +18,7 @@ services:
     volumes:
       - ./img_cache:/app/img_cache
       - ./.env:/app/.env
+      - ./attachments:/app/attachments
 
   mongo:
     image: mongo:6

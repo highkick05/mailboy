@@ -15,7 +15,12 @@ import { simpleParser } from 'mailparser';
 
 import { redis, connectDB, EmailModel, UserConfigModel, LabelModel, SmartRuleModel } from './db';
 import { resolveBrandLogo, resolveBrandName, TRANSPARENT_PIXEL } from './logo-engine';
+
+// 🛑 1. IMPORT STANDARD WORKERS
 import { startWorkerSwarm, runFullSync, runQuickSync, getQueue, activeClients, syncLocks, syncCooldowns, userWorkers, workerState, systemStats, getFolderMap, preWarmCache, spawnBackgroundClient, killSwarm, syncRangeAtomic } from './workers';
+
+// 🛑 2. IMPORT DRAFT WORKER SEPARATELY
+import { runDraftWorker, uplinkLogs } from './draftWorker';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -24,15 +29,6 @@ const app = express();
 const CACHE_DIR = path.join(process.cwd(), 'img_cache');
 const ATTACHMENT_DIR = path.join(process.cwd(), 'attachments');
 const REDIS_TTL = 86400; 
-
-// 🛑 DEBUGGING: In-Memory Draft Logs
-const draftLogs: { time: string, id: string, msg: string, type: 'info'|'success'|'error' }[] = [];
-const logDraft = (id: string, msg: string, type: 'info'|'success'|'error' = 'info') => {
-    const time = new Date().toLocaleTimeString();
-    draftLogs.unshift({ time, id, msg, type });
-    if (draftLogs.length > 50) draftLogs.pop();
-    console.log(`[DraftLog] ${msg}`);
-};
 
 // Global Error Handler
 process.on('uncaughtException', (err: any) => {
@@ -156,7 +152,11 @@ app.post('/api/v1/mail/sync', async (req, res) => {
   if (syncLocks.get(user)) return res.json({ status: 'SYNC_IN_PROGRESS' });
   syncLocks.set(user, true);
   await redis.setex(`sync_active:${user}`, 30, '1');
+  
+  // 🛑 3. START WORKERS SEPARATELY
   startWorkerSwarm(req.body);
+  setTimeout(() => runDraftWorker(req.body), 1000); 
+
   (async () => {
     try {
         const getClient = async (cfg: any) => {
@@ -277,53 +277,48 @@ app.get('/api/v1/mail/:id', async (req, res) => {
   res.status(408).json({ error: 'Fetch timed out - Worker busy' });
 });
 
-// 🛑 BATCH DELETE - UPDATED WITH IMAP SYNC
+// server.ts - Updated Batch Delete
 app.post('/api/v1/mail/batch-delete', async (req, res) => {
     const { ids, user } = req.body;
     if (!ids || !Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'No IDs provided' });
 
     try {
-        // 1. Fetch details before deletion so we know WHERE to delete from IMAP
         const emailsToDelete = await EmailModel.find({ id: { $in: ids }, user }, { uid: 1, folder: 1 });
-
-        // 2. Delete from Mongo (Optimistic)
         await EmailModel.deleteMany({ id: { $in: ids }, user });
         
-        // 3. Clear Cache
         for (const id of ids) await redis.del(`mail_obj:${id}:${user}`);
         const folders = ['Inbox', 'Trash', 'Spam', 'Drafts', 'Sent'];
         for (const f of folders) await redis.del(`mail:${user}:list:${f}:all`);
 
         res.json({ status: 'DELETED_OPTIMISTIC', count: ids.length });
 
-        // 🛑 4. PERFORM REAL IMAP DELETION
+        // PERFORM REAL IMAP DELETION
         const client = activeClients.get(user as string);
         if (client && client.usable && emailsToDelete.length > 0) {
             (async () => {
                 try {
                     const map = await getFolderMap(client, user as string);
-                    
-                    // Group by folder to handle deletions across different mailboxes
-                    const deletesByFolder: Record<string, string[]> = {};
+                    const deletesByFolder: Record<string, number[]> = {};
                     
                     for (const email of emailsToDelete) {
                         const folder = email.folder || 'Trash';
                         if (!deletesByFolder[folder]) deletesByFolder[folder] = [];
-                        if (email.uid) deletesByFolder[folder].push(email.uid.toString());
+                        if (email.uid) deletesByFolder[folder].push(email.uid);
                     }
 
-                    // Execute deletion per folder
                     for (const [folderName, uids] of Object.entries(deletesByFolder)) {
                         const path = map[folderName];
                         if (path && uids.length > 0) {
+                            // Use a Lock to ensure we have exclusive access to the folder
                             const lock = await client.getMailboxLock(path);
                             try {
-                                const uidString = uids.join(',');
-                                console.log(`🗑️ IMAP: Deleting ${uids.length} messages from ${folderName} (UIDs: ${uidString})`);
-                                await client.messageFlagsAdd(uidString, ['\\Deleted'], { uid: true });
-                                await client.messageDelete(uidString, { uid: true });
-                            } catch(e) {
-                                console.error(`IMAP Delete Failed [${folderName}]:`, e);
+                                // 🛑 FIX: Use a sequence set and a single delete command
+                                // Gmail handles \Deleted + Expunge automatically with messageDelete
+                                const uidRange = uids.sort((a,b) => a-b).join(',');
+                                console.log(`🗑️ IMAP: Executing bulk delete in ${folderName} for UIDs: ${uidRange}`);
+                                await client.messageDelete(uidRange, { uid: true });
+                            } catch(e: any) {
+                                console.error(`IMAP Delete Command Failed [${folderName}]: ${e.message}`);
                             } finally {
                                 lock.release();
                             }
@@ -369,175 +364,40 @@ app.delete('/api/v1/mail/:id', async (req, res) => {
     }
 });
 
-// 🛑 DRAFT SAVE - WITH SYNCHRONIZED DB CLEANUP
+// mailboy/server.ts - 🛑 UPDATED DRAFT ENDPOINT
 app.post('/api/v1/mail/draft', upload.array('files', 10), async (req, res) => {
-    const { user, to, subject, body, id } = req.body;
+    const { user, to, subject, body, id: clientId, existingAttachments: existingStr } = req.body;
     
-    // 🛑 DEBUG: Start
-    logDraft(id, `Start save request for: ${subject}`, 'info');
-
-    const client = activeClients.get(user);
-    if (!client || !client.usable) {
-        logDraft(id, 'Sync offline - failed to get client', 'error');
-        return res.status(503).json({ error: 'Sync offline' });
-    }
-
-    // 🛑 DB PERSISTENCE PREPARATION
-    let newUid: number | undefined;
-    const hasAttachments = (req.files && req.files.length > 0) || false;
-    let finalAttachments: any[] = []; 
-
+    // Parse existing attachments metadata (sent as JSON string)
+    let existingAttachments = [];
     try {
-        const map = await getFolderMap(client, user);
-        const draftsPath = map['Drafts'];
-        if (!draftsPath) return res.status(404).json({ error: 'Drafts folder not found' });
+        if (existingStr) existingAttachments = JSON.parse(existingStr);
+    } catch (e) {}
 
-        const lock = await client.getMailboxLock(draftsPath);
-        try {
-            // --- ATTACHMENT HANDLING ---
-            if (req.files && Array.isArray(req.files)) {
-                (req.files as Express.Multer.File[]).forEach(f => {
-                    finalAttachments.push({ filename: f.originalname, path: f.path });
-                });
-            }
+    // 1. STAGE IN REDIS (Immediate response)
+    const draftKey = `draft_stage:${user}:${clientId}`;
+    const payload = {
+        to, subject, body, 
+        timestamp: Date.now(),
+        files: req.files, // New files (Multer metadata)
+        existingAttachments   // Old files (Metadata from DB/State)
+    };
 
-            const uidsToDelete = new Set<string>();
-            let oldDraftSource: Buffer | null = null;
+    console.log(`[API 🌐] 📨 Received Draft Save. ID: ${clientId} | Size: ${body.length} chars | Attachments: ${existingAttachments.length} old, ${req.files?.length || 0} new`);
+    await redis.setex(draftKey, 3600, JSON.stringify(payload));
+    
+    // 2. TRIGGER BACKGROUND SYNC
+    const queue = getQueue(user);
+    const jobId = `sync-draft-${clientId}-${Date.now()}`;
+    queue.add({
+        id: jobId,
+        priority: 10, 
+        addedAt: Date.now(),
+        data: { type: 'DRAFT_SYNC', clientId, user },
+        attempts: 0
+    });
 
-            if (id) {
-                // 🛑 STRATEGY 1: ID is a UID?
-                const uidMatch = id.match(/uid-(\d+)-/);
-                if (uidMatch && uidMatch[1]) {
-                     uidsToDelete.add(uidMatch[1]);
-                     logDraft(id, `Matched UID in ID: ${uidMatch[1]}`, 'info');
-                }
-
-                // 🛑 STRATEGY 2: Header Match (Stable ID)
-                try {
-                    const headerSearch = { header: { 'X-Mailboy-Draft-ID': id } };
-                    for await (const msg of client.fetch(headerSearch, { uid: true, source: true })) {
-                        uidsToDelete.add(msg.uid.toString());
-                        if (!oldDraftSource) oldDraftSource = msg.source; 
-                    }
-                } catch(e) {}
-                
-                // 🛑 STRATEGY 3: CONTENT MATCH (Aggressive Deduplication)
-                // If To/Subject match exactly, we assume it's the same draft and nuke the old ones.
-                if (to && subject) {
-                     // logDraft(id, `Checking for duplicates by content...`, 'info');
-                     const contentSearch = { header: { to: to, subject: subject } };
-                     try {
-                         for await (const msg of client.fetch(contentSearch, { uid: true, source: true })) {
-                            uidsToDelete.add(msg.uid.toString());
-                            if (!oldDraftSource) oldDraftSource = msg.source;
-                         }
-                     } catch(e) {}
-                }
-
-                // Attempt attachment recovery
-                if (oldDraftSource && finalAttachments.length === 0) {
-                    try {
-                        const parsed = await simpleParser(oldDraftSource);
-                        if (parsed.attachments && parsed.attachments.length > 0) {
-                            parsed.attachments.forEach(att => {
-                                finalAttachments.push({
-                                    filename: att.filename,
-                                    content: att.content, 
-                                    contentType: att.contentType
-                                });
-                            });
-                        }
-                    } catch (err) { }
-                }
-            }
-
-            // 🛑 EXECUTE DELETE (IMAP + MONGO)
-            if (uidsToDelete.size > 0) {
-                const uidString = Array.from(uidsToDelete).join(',');
-                const uidsArray = Array.from(uidsToDelete).map(u => parseInt(u));
-                
-                logDraft(id, `🔥 Scorched Earth: Deleting UIDs ${uidString} from IMAP & DB`, 'info');
-                
-                // 1. DELETE FROM IMAP
-                await client.messageFlagsAdd(uidString, ['\\Deleted'], { uid: true });
-                await client.messageDelete(uidString, { uid: true }); 
-                
-                // 2. DELETE FROM MONGO IMMEDIATELY (Fixes the UI Duplicate Bug)
-                await EmailModel.deleteMany({ uid: { $in: uidsArray }, user });
-            }
-
-            const mail = new MailComposer({
-                from: user,
-                to: to,
-                subject: subject,
-                html: body,
-                text: body.replace(/<[^>]*>?/gm, ''),
-                headers: { 'X-Mailboy-Draft-ID': id },
-                attachments: finalAttachments
-            });
-
-            const messageBuffer = await mail.compile().build();
-            
-            // 🛑 SAFE APPEND
-            try {
-                const appendResult = await client.append(draftsPath, messageBuffer, ['\\Draft']);
-                if (appendResult && appendResult.uid) {
-                    newUid = appendResult.uid;
-                    logDraft(id, `IMAP Append success. UID: ${newUid}`, 'success');
-                } else {
-                    logDraft(id, `UID missing. Triggering fallback search...`, 'info');
-                    const checkSearch = { header: { 'X-Mailboy-Draft-ID': id } };
-                    for await (const msg of client.fetch(checkSearch, { uid: true })) {
-                        newUid = msg.uid;
-                        logDraft(id, `Fallback search recovered UID: ${newUid}`, 'success');
-                        break;
-                    }
-                }
-            } catch (imapErr: any) {
-                logDraft(id, `IMAP Append Failed: ${imapErr.message}. Saving to DB anyway.`, 'error');
-            }
-
-        } finally {
-            lock.release();
-        }
-        
-        await redis.del(`mail:${user}:list:Drafts`);
-
-        // 🛑 GUARANTEED DB PERSISTENCE
-        const finalDbId = newUid ? `uid-${newUid}-${user}` : id;
-        
-        await EmailModel.findOneAndUpdate(
-             { id: finalDbId },
-             {
-                 id: finalDbId,
-                 uid: newUid || 0, 
-                 user: user,
-                 folder: 'Drafts',
-                 from: user,
-                 to: to,
-                 subject: subject,
-                 body: body,
-                 preview: body.replace(/<[^>]*>?/gm, '').substring(0, 150),
-                 timestamp: Date.now(),
-                 read: true,
-                 labels: [],
-                 isFullBody: true,
-                 hasAttachments: finalAttachments.length > 0,
-                 attachments: finalAttachments.map(a => ({ 
-                     filename: a.filename, 
-                     contentType: a.contentType,
-                     size: a.content ? a.content.length : 0 
-                 })) 
-             },
-             { upsert: true, new: true }
-        );
-        logDraft(id, `✅ DB SAVED! ID: ${finalDbId} (UID: ${newUid || 'Pending'})`, 'success');
-
-        res.json({ status: 'SAVED', id: finalDbId, timestamp: Date.now() });
-    } catch (e: any) {
-        logDraft(id, `🔥 FATAL ERROR: ${e.message}`, 'error');
-        res.status(500).json({ error: e.message });
-    }
+    res.json({ status: 'STAGED', id: clientId });
 });
 
 app.get('/api/v1/proxy/image', async (req, res) => {
@@ -593,6 +453,16 @@ app.delete('/api/v1/debug/reset', async (req, res) => {
     await LabelModel.deleteMany({});
     await SmartRuleModel.deleteMany({}); 
     
+    try {
+        const files = await fs.readdir(ATTACHMENT_DIR);
+        for (const file of files) {
+            await fs.unlink(path.join(ATTACHMENT_DIR, file));
+        }
+        console.log(`🗑️ Deleted ${files.length} physical attachments.`);
+    } catch(e) {
+        console.warn("⚠️ Could not clear attachments folder", e);
+    }
+
     console.log("✨ System Reset Cleanly");
     res.json({ status: 'SYSTEM_WIPED' });
   } catch (e) { 
@@ -605,13 +475,14 @@ app.get('/api/v1/debug/workers', (req, res) => {
         workers: workerState.map(w => ({ ...w, ageMs: w.status === 'WORKING' ? Date.now() - w.lastActivity : 0 })),
         system: systemStats,
         locks: Array.from(syncLocks.keys()),
-        draftLogs, // 🛑 EXPOSE LOGS
+        uplinkLogs, // 🛑 EXPOSE UPLINK LOGS FROM NEW FILE
         timestamp: Date.now()
     });
 });
 
 app.get('/monitor', (req, res) => {
-    res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Mailboy Console</title><style>body{background:#0f172a;color:#e2e8f0;font-family:'Courier New',monospace;padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:20px}.card{background:#1e293b;padding:15px;border-radius:8px;border:1px solid #334155}.card.working{border-color:#22c55e;box-shadow:0 0 10px rgba(34,197,94,0.2)}.card.error{border-color:#ef4444}h1{font-size:1.5rem;margin-bottom:10px;color:#38bdf8}.stat-val{font-size:1.5rem;font-weight:bold}.stat-label{color:#94a3b8;font-size:0.8rem}.logs{background:#020617;padding:10px;border-radius:8px;height:300px;overflow-y:auto;font-size:0.8rem}.log-item{margin-bottom:4px;border-bottom:1px solid #1e293b;padding-bottom:2px}.success{color:#4ade80}.error{color:#ef4444}.info{color:#94a3b8}</style></head><body><div style="display:flex;justify-content:space-between;align-items:center;"><h1>⚡ Mailboy Swarm</h1><div id="clock">--:--:--</div></div><div class="grid"><div class="card"><div class="stat-val" id="jobsCompleted">0</div><div class="stat-label">Jobs Done</div></div><div class="card"><div class="stat-val" id="queueSize">0</div><div class="stat-label">Queue</div></div><div class="card"><div class="stat-val" id="activeLocks">0</div><div class="stat-label">Active Syncs</div></div></div><h3>Draft Live Logs</h3><div class="logs" id="draftLogs"></div><h3>Workers</h3><div class="grid" id="workerGrid"></div><script>function update(){fetch('/api/v1/debug/workers').then(r=>r.json()).then(data=>{document.getElementById('jobsCompleted').innerText=data.system.jobsCompleted;document.getElementById('queueSize').innerText=data.queue?.pending||0;document.getElementById('activeLocks').innerText=data.locks.length;const logContainer=document.getElementById('draftLogs');if(data.draftLogs){logContainer.innerHTML=data.draftLogs.map(l=>\`<div class="log-item \${l.type}">[\${l.time}] \${l.msg} <span style="opacity:0.5;font-size:0.7em">(\${l.id.slice(-6)})</span></div>\`).join('');}const grid=document.getElementById('workerGrid');grid.innerHTML=data.workers.map(w=>{const statusClass=w.status==='WORKING'?'working':(w.status==='ERROR'?'error':'');return \`<div class="card \${statusClass}"><div><strong>Worker \${w.id}</strong></div><div style="color:\${w.status==='WORKING'?'#4ade80':'#64748b'}">\${w.status}</div>\${w.status==='WORKING'?\`<div style="font-size:0.75rem;margin-top:5px;word-break:break-all;">\${w.jobId}</div><div style="font-size:0.75rem;color:#facc15;">\${(w.ageMs/1000).toFixed(1)}s</div><div style="font-size:0.75rem;color:#94a3b8;">📂 \${w.folder}</div>\`:''}</div>\`}).join('');document.getElementById('clock').innerText=new Date().toLocaleTimeString()})}setInterval(update,1000);update();</script></body></html>`);
+    // 🛑 UPDATED MONITOR: Workers on Top, Draft Feed on Bottom, Renamed Worker 99, Added Purple CSS
+    res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Mailboy Console</title><style>body{background:#0f172a;color:#e2e8f0;font-family:'Courier New',monospace;padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:20px}.card{background:#1e293b;padding:15px;border-radius:8px;border:1px solid #334155}.card.working{border-color:#22c55e;box-shadow:0 0 10px rgba(34,197,94,0.2)}.card.error{border-color:#ef4444}.card.draft-uplink{border-color:#a855f7;box-shadow:0 0 10px rgba(168,85,247,0.2)}h1{font-size:1.5rem;margin-bottom:10px;color:#38bdf8}.stat-val{font-size:1.5rem;font-weight:bold}.stat-label{color:#94a3b8;font-size:0.8rem}.logs{background:#020617;padding:10px;border-radius:8px;height:400px;overflow-y:auto;font-size:0.85rem;border:1px solid #334155;}.log-item{margin-bottom:6px;border-bottom:1px solid #1e293b;padding-bottom:4px;display:flex;gap:10px;}.log-time{color:#64748b;min-width:80px;}.log-msg{flex:1;}.success{color:#4ade80}.error{color:#ef4444}.warn{color:#facc15}.info{color:#94a3b8}</style></head><body><div style="display:flex;justify-content:space-between;align-items:center;"><h1>⚡ Mailboy Swarm</h1><div id="clock">--:--:--</div></div><div class="grid"><div class="card"><div class="stat-val" id="jobsCompleted">0</div><div class="stat-label">Jobs Done</div></div><div class="card"><div class="stat-val" id="queueSize">0</div><div class="stat-label">Queue</div></div><div class="card"><div class="stat-val" id="activeLocks">0</div><div class="stat-label">Active Syncs</div></div></div><h3>Workers</h3><div class="grid" id="workerGrid"></div><h3>📡 Draft Uplink Feed</h3><div class="logs" id="uplinkLogs"></div><script>function update(){fetch('/api/v1/debug/workers').then(r=>r.json()).then(data=>{document.getElementById('jobsCompleted').innerText=data.system.jobsCompleted;document.getElementById('queueSize').innerText=data.queue?.pending||0;document.getElementById('activeLocks').innerText=data.locks.length;const logContainer=document.getElementById('uplinkLogs');if(data.uplinkLogs){logContainer.innerHTML=data.uplinkLogs.map(l=>\`<div class="log-item \${l.type}"><div class="log-time">\${l.time}</div><div class="log-msg">\${l.msg}</div></div>\`).join('');}const grid=document.getElementById('workerGrid');grid.innerHTML=data.workers.map(w=>{let statusClass='';if(w.status==='WORKING')statusClass='working';else if(w.status==='ERROR')statusClass='error';if(w.id===99)statusClass+=' draft-uplink';const workerName=w.id===99?'Draft Uplink':'Worker '+w.id;return \`<div class="card \${statusClass}"><div><strong>\${workerName}</strong></div><div style="color:\${w.status==='WORKING'?'#4ade80':'#64748b'}">\${w.status}</div>\${w.status==='WORKING'?\`<div style="font-size:0.75rem;margin-top:5px;word-break:break-all;">\${w.jobId}</div><div style="font-size:0.75rem;color:#facc15;">\${(w.ageMs/1000).toFixed(1)}s</div><div style="font-size:0.75rem;color:#94a3b8;">📂 \${w.folder}</div>\`:''}</div>\`}).join('');document.getElementById('clock').innerText=new Date().toLocaleTimeString()})}setInterval(update,1000);update();</script></body></html>`);
 });
 
 // ... rest of the file (send, mark, move, etc) matches previous version

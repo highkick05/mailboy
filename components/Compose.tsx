@@ -2,9 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 
 interface ComposeProps {
   onClose: () => void;
-  // onSend includes files and the stable draftId
   onSend: (payload: { to: string; cc?: string; bcc?: string; subject: string; body: string; files?: File[]; draftId?: string; existingAttachments?: any[] }) => Promise<void>;
-  // 🛑 UPDATED: onSaveDraft now returns the new server ID string
   onSaveDraft?: (to: string, subject: string, body: string, id?: string, saveToServer?: boolean, files?: File[], existingAttachments?: any[]) => Promise<string | void>;
   userEmail: string;
   initialData?: {
@@ -39,14 +37,14 @@ export default function Compose({ onClose, onSend, onSaveDraft, userEmail, initi
   // Refs
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
-  const draftIdRef = useRef(initialData?.id || `draft-${Date.now()}`); // Stable ID for Idempotency
+  const draftIdRef = useRef(initialData?.id || `draft-${Date.now()}`); // Stable ID
   const isSentRef = useRef(false); 
   
   // Timers
   const localSaveTimer = useRef<NodeJS.Timeout | null>(null);
   const serverSaveTimer = useRef<NodeJS.Timeout | null>(null);
 
-  // --- 1. INITIALIZATION ---
+  // --- 1. INITIALIZATION & RECOVERY ---
   useEffect(() => {
     if (initialData) {
       setTo(initialData.to || '');
@@ -54,100 +52,101 @@ export default function Compose({ onClose, onSend, onSaveDraft, userEmail, initi
       setSubject(initialData.subject || '');
       setBody(initialData.body || '');
       setExistingAttachments(initialData.attachments || []);
-      if (editorRef.current) editorRef.current.innerHTML = initialData.body ? `<br>${initialData.body}` : '';
+      if (editorRef.current) editorRef.current.innerHTML = initialData.body ? initialData.body : '';
       if (initialData.cc) setShowCcBcc(true);
+      // Don't override draftIdRef if it's already set (prevents race conditions)
+      if (initialData.id) draftIdRef.current = initialData.id;
     } else {
-      // Restore from Crash Cache (LocalStorage)
+      // Restore from Crash Cache
       const cached = localStorage.getItem('mailboy_draft_cache');
       if (cached) {
         try {
           const d = JSON.parse(cached);
-          if (d.id === draftIdRef.current) { // Only restore if it matches current intent or is generic
-             setTo(d.to || '');
-             setSubject(d.subject || '');
-             setBody(d.body || '');
-             if (editorRef.current) editorRef.current.innerHTML = d.body || '';
-          }
+          console.log(`[Frontend 🎨] ♻️ Restored draft from crash cache: ${d.id}`);
+          setTo(d.to || '');
+          setSubject(d.subject || '');
+          setBody(d.body || '');
+          if (editorRef.current) editorRef.current.innerHTML = d.body || '';
+          draftIdRef.current = d.id;
         } catch (e) {}
       }
     }
   }, [initialData]);
 
-  // --- 2. THE "SAVE ON PAUSE" LOGIC ---
+  // --- 2. THE RE-ENGINEERED AUTOSAVE LOGIC ---
   useEffect(() => {
     if (!onSaveDraft || isSentRef.current) return;
 
-    // A. Clear existing timers (Debounce)
     if (localSaveTimer.current) clearTimeout(localSaveTimer.current);
     if (serverSaveTimer.current) clearTimeout(serverSaveTimer.current);
 
-    // B. Set Status to "Unsaved changes..."
-    if (saveStatus !== 'saving') setSaveStatus('idle');
+    setSaveStatus('idle');
 
-    // C. CACHE LAYER (Fast - 1s)
-    // Saves to localStorage just in case the browser crashes before the server save
+    // A. CACHE LAYER (1s) - LocalStorage Persistence
     localSaveTimer.current = setTimeout(() => {
         const content = editorRef.current?.innerHTML || '';
         const payload = { to, subject, body: content, id: draftIdRef.current };
         localStorage.setItem('mailboy_draft_cache', JSON.stringify(payload));
-        // Update Parent UI list immediately (Optimistic)
+        
+        // Optimistic UI Update (Passes files for local state consistency)
         onSaveDraft(to, subject, content, draftIdRef.current, false, files, existingAttachments);
     }, 1000);
 
-    // D. SERVER LAYER (Pause Detection - 2s)
-    // Only hits the API when user stops typing for 2 seconds
+    // B. BACKGROUND SYNC LAYER (2s) - Faster Autosave
     serverSaveTimer.current = setTimeout(async () => {
         const content = editorRef.current?.innerHTML || '';
-        const hasContent = to || subject || (content && content !== '<br>') || files.length > 0;
-
-        if (hasContent) {
+        const hasAttachments = files.length > 0 || existingAttachments.length > 0;
+        
+        if (to || subject || (content && content !== '<br>') || hasAttachments) {
+            console.log(`[Frontend 🎨] 💾 Autosave Timer Fired for ID: ${draftIdRef.current}`);
             setSaveStatus('saving');
+            const startTime = Date.now();
             try {
-                console.log("💾 Pause detected: Saving to Server...");
-                // 🛑 CRITICAL FIX: Capture the returned ID from the server
-                const newServerId = await onSaveDraft(to, subject, content, draftIdRef.current, true, files, existingAttachments);
+                // 🛑 CRITICAL: Send files and existingAttachments
+                await onSaveDraft(
+                    to, 
+                    subject, 
+                    content, 
+                    draftIdRef.current, 
+                    true, 
+                    files, 
+                    existingAttachments
+                );
                 
-                // If server returns a new ID (e.g. uid-123 instead of temp-456), switch to it immediately
-                if (newServerId && typeof newServerId === 'string' && newServerId !== draftIdRef.current) {
-                    console.log(`🔀 Draft ID Swapped: ${draftIdRef.current} -> ${newServerId}`);
-                    draftIdRef.current = newServerId;
-                }
-
+                console.log(`[Frontend 🎨] 📡 Server Responded in ${Date.now() - startTime}ms`);
+                
+                // 🛑 CHANGE: We DO NOT update draftIdRef here. 
+                // We keep using the Client ID (draft-123) for this session to prevent duplication.
+                // The Worker handles mapping draft-123 to the correct IMAP UID.
+                
                 setSaveStatus('saved');
                 setLastSaved(new Date());
             } catch (e) {
+                console.error(`[Frontend 🎨] ❌ Save Failed`, e);
                 setSaveStatus('error');
             }
         }
-    }, 2000); // 2 Seconds Pause Threshold
+    }, 2000); // 🛑 CHANGED: Shortened to 2s
 
     return () => {
         if (localSaveTimer.current) clearTimeout(localSaveTimer.current);
         if (serverSaveTimer.current) clearTimeout(serverSaveTimer.current);
     };
-  }, [to, subject, body, files, existingAttachments, onSaveDraft]); // Dependencies trigger the effect on any change
+  }, [to, subject, body, files, existingAttachments, onSaveDraft]);
 
-  // --- HANDLERS ---
-
-  // Manual Save (Ctrl+S) - Safety net
+  // Manual Save (Ctrl+S)
   useEffect(() => {
       const handleKeyDown = (e: KeyboardEvent) => {
           if ((e.ctrlKey || e.metaKey) && e.key === 's') {
               e.preventDefault();
               if (onSaveDraft && !isSentRef.current) {
-                  // Cancel pending debounce to avoid double save
+                  console.log(`[Frontend 🎨] ⌨️ Manual Save Triggered (Ctrl+S)`);
                   if (serverSaveTimer.current) clearTimeout(serverSaveTimer.current);
-                  
                   setSaveStatus('saving');
                   const content = editorRef.current?.innerHTML || '';
                   
                   onSaveDraft(to, subject, content, draftIdRef.current, true, files, existingAttachments)
-                      .then((newServerId) => {
-                          // 🛑 CRITICAL FIX: Update ID here too
-                          if (newServerId && typeof newServerId === 'string' && newServerId !== draftIdRef.current) {
-                              console.log(`🔀 Manual Save ID Swap: ${draftIdRef.current} -> ${newServerId}`);
-                              draftIdRef.current = newServerId;
-                          }
+                      .then(() => {
                           setSaveStatus('saved');
                           setLastSaved(new Date());
                       });
@@ -173,10 +172,11 @@ export default function Compose({ onClose, onSend, onSaveDraft, userEmail, initi
   const handleSend = async () => {
     if (!to) return alert('Please add a recipient');
     setIsSending(true);
-    isSentRef.current = true; // Stop autosave
+    isSentRef.current = true; 
     
     try {
       const content = editorRef.current?.innerHTML || '';
+      console.log(`[Frontend 🎨] 🚀 Sending Message...`);
       await onSend({ 
           to, cc, bcc, subject, 
           body: content, 
@@ -184,9 +184,11 @@ export default function Compose({ onClose, onSend, onSaveDraft, userEmail, initi
           existingAttachments, 
           draftId: draftIdRef.current 
       });
+      console.log(`[Frontend 🎨] ✅ Message Sent. Cleaning up.`);
       localStorage.removeItem('mailboy_draft_cache'); 
       onClose();
     } catch (e) {
+      console.error(`[Frontend 🎨] ❌ Send Failed`, e);
       alert('Failed to send');
       setIsSending(false);
       isSentRef.current = false;
@@ -194,12 +196,10 @@ export default function Compose({ onClose, onSend, onSaveDraft, userEmail, initi
   };
 
   const handleClose = () => {
-      // One final save check if not sent
       localStorage.removeItem('mailboy_draft_cache');
       onClose();
   };
 
-  // Helper for "Saved 2s ago"
   const getTimeAgo = (date: Date) => {
       const seconds = Math.floor((new Date().getTime() - date.getTime()) / 1000);
       if (seconds < 5) return 'just now';
@@ -215,22 +215,20 @@ export default function Compose({ onClose, onSend, onSaveDraft, userEmail, initi
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/50">
           <div className="flex items-center gap-3">
               <h2 className="text-lg font-bold text-slate-700 dark:text-slate-200">New Message</h2>
-              
-              {/* VISUAL FEEDBACK */}
-              <div className="flex items-center gap-2 transition-all duration-300">
+              <div className="flex items-center gap-2">
                   {saveStatus === 'saving' && (
                       <span className="text-[10px] uppercase font-bold tracking-wider text-blue-500 border border-blue-200 dark:border-blue-900 px-2 py-0.5 rounded animate-pulse">
-                          Saving...
+                          Syncing...
                       </span>
                   )}
                   {saveStatus === 'saved' && lastSaved && (
-                      <span className="text-[10px] uppercase font-bold tracking-wider text-green-600 dark:text-green-400 border border-green-200 dark:border-green-900 px-2 py-0.5 rounded animate-in fade-in">
+                      <span className="text-[10px] uppercase font-bold tracking-wider text-green-600 dark:text-green-400 border border-green-200 dark:border-green-900 px-2 py-0.5 rounded">
                           Saved {getTimeAgo(lastSaved)}
                       </span>
                   )}
                   {saveStatus === 'error' && (
                       <span className="text-[10px] uppercase font-bold tracking-wider text-red-500 border border-red-200 px-2 py-0.5 rounded">
-                          Save Failed
+                          Offline
                       </span>
                   )}
               </div>
@@ -267,7 +265,7 @@ export default function Compose({ onClose, onSend, onSaveDraft, userEmail, initi
           </div>
         </div>
 
-        {/* Attachment Chips Area */}
+        {/* ATTACHMENTS */}
         <div className="px-6 pb-2 flex flex-wrap gap-2 animate-in slide-in-from-top-1">
            {existingAttachments.map((att, i) => (
                <div key={`exist-${i}`} className="flex items-center gap-2 bg-blue-100 dark:bg-blue-900/30 px-3 py-1.5 rounded-lg text-xs font-bold text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800 shadow-sm">
@@ -302,7 +300,7 @@ export default function Compose({ onClose, onSend, onSaveDraft, userEmail, initi
                     <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
                 </button>
                 <input type="file" multiple ref={fileInputRef} className="hidden" onChange={handleFileChange} />
-                <div className="text-xs text-slate-400 font-medium px-2 border-l border-slate-200 dark:border-slate-700">Sending as <span className="text-slate-600 dark:text-slate-300">{userEmail}</span></div>
+                <div className="text-xs text-slate-400 font-medium px-2 border-l border-slate-200 dark:border-slate-700">From <span className="text-slate-600 dark:text-slate-300">{userEmail}</span></div>
             </div>
 
             <div className="flex items-center gap-3">
